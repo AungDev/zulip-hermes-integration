@@ -42,7 +42,15 @@ class BasePlatformAdapter:
     def __init__(self, config, platform):
         self._config = config
         self._platform = platform
+        self.platform = platform
         self._connected = False
+
+    @property
+    def name(self) -> str:
+        """Human-readable name for this adapter (mirrors the real
+        BasePlatformAdapter.name property in gateway.platforms.base)."""
+        value = getattr(self.platform, "value", self.platform)
+        return str(value).title()
 
     def build_source(self, **kwargs):
         return MessageSource(**kwargs)

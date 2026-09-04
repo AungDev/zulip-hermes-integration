@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+import tempfile
 
 import pytest
 
@@ -174,6 +175,52 @@ class TestUploadFileToZulip:
         assert url == "https://zulip.example.com/user_uploads/1/test.txt"
 
     @pytest.mark.asyncio
+    async def test_upload_success_strips_api_suffix_from_base_url(self, tmp_path):
+        """Regression: python-zulip-api's real Client.base_url always ends in
+        "/api/" (Client.__init__ unconditionally appends it), while the
+        upload endpoint's `uri` is server-root-relative. Naively
+        concatenating the two produced "https://host/api//user_uploads/..."
+        — a double slash that 404s. The previous test used a bare
+        "https://zulip.example.com" base_url with no "/api" suffix at all,
+        so it never actually exercised this path."""
+        from zulip.media import upload_file_to_zulip
+
+        test_file = tmp_path / "test.png"
+        test_file.write_bytes(b"\x89PNG")
+
+        mock_client = MagicMock()
+        mock_client.upload_file.return_value = {
+            "result": "success",
+            "uri": "/user_uploads/1/test.png",
+        }
+        # Matches the real SDK exactly: rstrip("/") then += "/api/".
+        mock_client.base_url = "https://zulip.example.com/api/"
+
+        url = await upload_file_to_zulip(mock_client, str(test_file), str(tmp_path))
+        assert url == "https://zulip.example.com/user_uploads/1/test.png"
+        assert "/api/" not in url
+        assert "//user_uploads" not in url
+
+    @pytest.mark.asyncio
+    async def test_upload_success_strips_api_suffix_without_trailing_slash(self, tmp_path):
+        """Same as above but base_url ends in bare "/api" (no trailing
+        slash) — the other form seen across zulip SDK versions/mocks."""
+        from zulip.media import upload_file_to_zulip
+
+        test_file = tmp_path / "test.png"
+        test_file.write_bytes(b"\x89PNG")
+
+        mock_client = MagicMock()
+        mock_client.upload_file.return_value = {
+            "result": "success",
+            "uri": "/user_uploads/1/test.png",
+        }
+        mock_client.base_url = "https://zulip.example.com/api"
+
+        url = await upload_file_to_zulip(mock_client, str(test_file), str(tmp_path))
+        assert url == "https://zulip.example.com/user_uploads/1/test.png"
+
+    @pytest.mark.asyncio
     async def test_rejects_symlink(self, tmp_path):
         from zulip.media import upload_file_to_zulip
 
@@ -218,6 +265,63 @@ class TestUploadFileToZulip:
 
         # Restore tempdir
         tempfile.tempdir = original_temp
+
+    @pytest.mark.asyncio
+    async def test_allow_dirs_env_permits_extra_root(self, tmp_path, monkeypatch):
+        """HERMES_MEDIA_ALLOW_DIRS mirrors gateway.platforms.base's operator
+        allowlist env var of the same name — a dir listed there must be
+        accepted even when it's outside both system temp and HERMES_DATA_DIR
+        (e.g. browser-harness's screenshot cache under ~/.config)."""
+        from zulip.media import upload_file_to_zulip
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        extra_root = tmp_path / "browser-harness" / "tmp"
+        extra_root.mkdir(parents=True)
+        screenshot = extra_root / "shot.png"
+        screenshot.write_bytes(b"\x89PNG")
+
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(extra_root))
+
+        mock_client = MagicMock()
+        mock_client.upload_file.return_value = {"result": "success", "uri": "/user_uploads/1/shot.png"}
+        mock_client.base_url = "https://z.com"
+
+        url = await upload_file_to_zulip(mock_client, str(screenshot), str(data_dir))
+        assert url == "https://z.com/user_uploads/1/shot.png"
+        mock_client.upload_file.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_allow_dirs_env_does_not_widen_beyond_listed_root(self, tmp_path, monkeypatch):
+        """A sibling directory not itself listed in HERMES_MEDIA_ALLOW_DIRS
+        must still be rejected — the allowlist is exact-root, not a prefix
+        guess across the whole parent tree."""
+        from zulip.media import upload_file_to_zulip
+
+        # Isolate from the real system temp dir (same technique as
+        # test_rejects_path_outside_allowed above) so this sibling path
+        # isn't accidentally covered by the always-allowed tmp_dir root.
+        original_temp = tempfile.tempdir
+        tempfile.tempdir = str(tmp_path / "other_temp")
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        allowed_root = tmp_path / "allowed"
+        allowed_root.mkdir()
+        sibling = tmp_path / "allowed-but-not-really"
+        sibling.mkdir()
+        outside = sibling / "secret.txt"
+        outside.write_text("nope")
+
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(allowed_root))
+
+        mock_client = MagicMock()
+        try:
+            with pytest.raises(ValueError, match="unauthorized path"):
+                await upload_file_to_zulip(mock_client, str(outside), str(data_dir))
+            mock_client.upload_file.assert_not_called()
+        finally:
+            tempfile.tempdir = original_temp
 
     @pytest.mark.asyncio
     async def test_rejects_nonexistent_file(self, tmp_path):

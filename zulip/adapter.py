@@ -1506,6 +1506,87 @@ class ZulipAdapter(BasePlatformAdapter):
             logger.error("get_user_info error: %s", e)
             return None
 
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local image as a native Zulip attachment (overrides the
+        base class's "unavailable" stub — see upstream Hermes issue about
+        MEDIA:<path> screenshots silently failing to deliver on Zulip).
+
+        Zulip has no separate "photo" primitive: an uploaded file becomes an
+        inline image automatically when its URL is embedded in message
+        markdown (``![name](url)``), so this just uploads via
+        upload_file_to_zulip() and sends that markdown as the message body.
+        """
+        return await self._send_uploaded_media(
+            chat_id=chat_id,
+            file_path=image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+            as_image=True,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local file as a native Zulip attachment (overrides the
+        base class's "unavailable" stub)."""
+        return await self._send_uploaded_media(
+            chat_id=chat_id,
+            file_path=file_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+            as_image=False,
+        )
+
+    async def _send_uploaded_media(
+        self,
+        *,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str],
+        reply_to: Optional[str],
+        metadata: Optional[dict],
+        as_image: bool,
+    ) -> SendResult:
+        data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
+        try:
+            url = await upload_file_to_zulip(self.client, file_path, data_dir)
+        except Exception as e:
+            logger.error(
+                "[%s] native media upload failed [file=%s]: %s",
+                self.name, mask_pii(file_path), e,
+            )
+            text = "⚠️ Couldn't deliver the image attachment." if as_image else "⚠️ Couldn't deliver the file attachment."
+            if caption:
+                text = f"{caption}\n{text}"
+            return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+
+        _safe_delete_temp_file(file_path)
+
+        name = Path(file_path).name
+        # `![alt](url)` renders inline in Zulip; plain `[name](url)` is a
+        # downloadable link — same distinction the platform's own compose
+        # box makes for drag-and-drop uploads.
+        link = f"![{name}]({url})" if as_image else f"[{name}]({url})"
+        content = f"{caption}\n{link}" if caption else link
+        return await self.send(chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata)
+
     async def send(
         self,
         chat_id: str,

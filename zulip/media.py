@@ -171,14 +171,42 @@ async def upload_file_to_zulip(
 
     tmp_dir = Path(tempfile.gettempdir()).resolve()
     allowed_data = Path(data_dir).expanduser().resolve()
+    allowed_roots = [tmp_dir, allowed_data]
 
-    if not (
-        str(resolved).startswith(str(tmp_dir))
-        or str(resolved).startswith(str(allowed_data))
-    ):
+    # HERMES_MEDIA_ALLOW_DIRS: same operator allowlist env var the gateway
+    # core honors in gateway.platforms.base._media_delivery_allowed_roots
+    # (colon- or comma-separated absolute dirs). By the time send_image_file/
+    # send_document reach here, the gateway has ALREADY run
+    # filter_media_delivery_paths against this exact allowlist plus its
+    # denylist — so this check is defense-in-depth, not the primary gate,
+    # and must not be stricter than the gateway's own decision or an
+    # approved path (e.g. a browser-harness screenshot cache dir) gets
+    # silently dropped a second time here.
+    for chunk in os.environ.get("HERMES_MEDIA_ALLOW_DIRS", "").split(os.pathsep):
+        for raw_root in chunk.split(","):
+            raw_root = raw_root.strip()
+            if not raw_root:
+                continue
+            try:
+                allowed_roots.append(Path(raw_root).expanduser().resolve())
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+    def _is_within(p: Path, root: Path) -> bool:
+        # True containment, not string prefix: str.startswith() would wrongly
+        # accept a sibling like "/tmp/allowed-but-not-really" as being under
+        # "/tmp/allowed". Path.relative_to() only succeeds for real descendants
+        # (or the root itself).
+        try:
+            p.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    if not any(_is_within(resolved, root) for root in allowed_roots):
         raise ValueError(
             f"Refusing to upload from unauthorized path: {file_path}. "
-            f"Allowed: {tmp_dir} or {allowed_data}"
+            f"Allowed: {', '.join(str(r) for r in allowed_roots)}"
         )
 
     # Re-open for reading (safe: already validated)
@@ -194,6 +222,20 @@ async def upload_file_to_zulip(
 
     if uri.startswith("/"):
         base = getattr(client, "base_url", "")
+        # client.base_url (python-zulip-api) always ends in "/api/" (see
+        # zulip.Client.__init__: it strips trailing slashes then
+        # unconditionally appends "/api/"), and the upload endpoint's own
+        # `uri` in the response is server-root-relative (e.g.
+        # "/user_uploads/..."), NOT api-relative. Concatenating the two
+        # verbatim produces "https://host/api//user_uploads/..." — a
+        # double slash that 404s. Strip the "/api/" (or "/api") suffix so
+        # we land back at the server root before appending uri.
+        if base.endswith("/api/"):
+            base = base[: -len("/api/")]
+        elif base.endswith("/api"):
+            base = base[: -len("/api")]
+        else:
+            base = base.rstrip("/")
         uri = base + uri
 
     return uri
