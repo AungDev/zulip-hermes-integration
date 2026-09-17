@@ -221,7 +221,6 @@ All synchronous SDK calls are wrapped with `asyncio.to_thread()` to keep the gat
 | `ZULIP_CHUNK_LIMIT` | `4000` | Max chars per message chunk |
 | `ZULIP_TOPIC_SESSIONS` | `false` | Per-topic conversation sessions (opt-in) |
 | `ZULIP_DM_SESSION_TURN_LIMIT` | `20` | DM session rotation after N turns (0 to disable) |
-| `ZULIP_TYPING_DELAY_SECONDS` | `2.0` | Typing indicator delay after send |
 | `ZULIP_STREAMS` | `*` | Comma-separated stream names to monitor |
 | `ZULIP_RESPONSE_PREFIX` | *(empty)* | Prepended to every outbound message |
 | `ZULIP_STREAM_OVERRIDES` | *(empty)* | JSON object mapping stream names to per-stream chatmode overrides |

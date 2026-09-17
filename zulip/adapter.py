@@ -249,11 +249,6 @@ DEFAULT_CONNECT_TIMEOUT = 30.0
 DEFAULT_READ_TIMEOUT = 60.0
 DEFAULT_SEND_TIMEOUT = 90.0
 
-# Typing indicator delay (seconds) — how long to keep typing visible after
-# the API confirms the message was sent, so the response is visible in the UI
-# before the typing indicator stops and the success reaction appears.
-DEFAULT_TYPING_DELAY = 2.0
-
 
 def _resolve_chunk_config() -> tuple[int, str]:
     """Read chunking config from environment."""
@@ -280,20 +275,6 @@ def _resolve_timeouts() -> tuple[float, float, float]:
     read = _parse(os.getenv("ZULIP_READ_TIMEOUT", ""), DEFAULT_READ_TIMEOUT)
     send = _parse(os.getenv("ZULIP_SEND_TIMEOUT", ""), DEFAULT_SEND_TIMEOUT)
     return connect, read, send
-
-
-def _resolve_typing_delay() -> float:
-    """Read typing indicator delay from environment.
-
-    After the message is accepted by the Zulip API, the typing indicator
-    stays active for this many seconds so the response has time to propagate
-    to all clients before the indicator stops and the success reaction fires.
-    """
-    try:
-        val = float(os.getenv("ZULIP_TYPING_DELAY_SECONDS", "").strip())
-        return max(0.0, val)
-    except (ValueError, AttributeError):
-        return DEFAULT_TYPING_DELAY
 
 
 def _resolve_streams_filter() -> set[str] | None:
@@ -555,9 +536,6 @@ class ZulipAdapter(BasePlatformAdapter):
         # Timeout configuration (Issue #62)
         self._connect_timeout, self._read_timeout, self._send_timeout = _resolve_timeouts()
 
-        # Typing indicator delay (Issue #96)
-        self._typing_delay = _resolve_typing_delay()
-
         # Stream filtering (Issue #65) — None means all streams
         self._streams_filter = _resolve_streams_filter()
 
@@ -656,6 +634,57 @@ class ZulipAdapter(BasePlatformAdapter):
             )
         except Exception:
             pass
+
+    def _typing_params_for_chat(self, chat_id: str, op: str) -> Optional[dict]:
+        """Map a gateway chat_id to Zulip set_typing_status params.
+
+        DM session rotation can suffix chat ids ("dm:<id>:session:<n>") —
+        strip to the raw numeric sender id. Streams are numeric stream ids;
+        the topic comes from the reply-threading cache.
+        """
+        if not chat_id:
+            return None
+        parts = chat_id.split(":")
+        if parts[0] == "dm":
+            user_id = parts[1] if len(parts) > 1 else ""
+            if not user_id.isdigit():
+                return None
+            return {"op": op, "type": "direct", "to": [int(user_id)]}
+        if chat_id.isdigit():
+            return {
+                "op": op,
+                "type": "stream",
+                "stream_id": int(chat_id),
+                "topic": self._topic_cache.get(chat_id, ""),
+            }
+        return None
+
+    async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
+        """Core typing hook: the gateway calls this every ~2s while the agent
+        runs (platform typing state expires after ~5s). Best-effort."""
+        try:
+            params = self._typing_params_for_chat(str(chat_id), "start")
+            if params:
+                await self._sdk_call(
+                    self.client.set_typing_status,
+                    params,
+                    timeout=self._send_timeout,
+                )
+        except Exception:
+            pass  # typing is best-effort
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Core typing hook: called when the agent run finishes. Best-effort."""
+        try:
+            params = self._typing_params_for_chat(str(chat_id), "stop")
+            if params:
+                await self._sdk_call(
+                    self.client.set_typing_status,
+                    params,
+                    timeout=self._send_timeout,
+                )
+        except Exception:
+            pass  # typing is best-effort
 
     async def _mark_read(self, message_id: Any) -> None:
         """Mark a message as read. Best-effort."""
@@ -1085,32 +1114,15 @@ class ZulipAdapter(BasePlatformAdapter):
         # Direct messages skip the stream block above and reach here normally.
         await reactions.start()
 
+        # Typing is owned by the gateway core's keep-typing loop, which calls
+        # the send_typing/stop_typing hooks above every ~2s for the whole
+        # agent run. The manual start this block used to do only ever lasted
+        # ZULIP_TYPING_DELAY_SECONDS, because handle_message() returns as
+        # soon as the background agent task is spawned — a ~2s flash instead
+        # of a real thinking indicator. Left as None so the legacy
+        # _stop_typing(typing_params) calls in the command/policy paths stay
+        # safe no-ops.
         typing_params = None
-        if msg_type == "private":
-            typing_params = {
-                "op": "start",
-                "type": "direct",
-                "to": [message.get("sender_id")],
-            }
-        elif msg_type == "stream":
-            typing_stream_id = message.get("stream_id")
-            if typing_stream_id:
-                typing_params = {
-                    "op": "start",
-                    "type": "stream",
-                    "stream_id": typing_stream_id,
-                    "topic": message.get("subject", ""),
-                }
-
-        if typing_params:
-            try:
-                await self._sdk_call(
-                    self.client.set_typing_status,
-                    typing_params,
-                    timeout=self._send_timeout,
-                )
-            except Exception:
-                pass  # typing is best-effort
 
         # --- Command interception (before AI dispatch) ---
         if is_command(content):
@@ -1286,12 +1298,9 @@ class ZulipAdapter(BasePlatformAdapter):
         finally:
             await self._mark_read(message_id)
 
-        # Only reached on success.
-        # Wait for the configured delay so the response is visible in the UI
-        # before the typing indicator stops and the success reaction appears.
-        if self._typing_delay > 0:
-            await asyncio.sleep(self._typing_delay)
-        await self._stop_typing(typing_params)
+        # Only reached on success. The core stops typing itself via the
+        # stop_typing() hook when the agent run finishes; mark the success
+        # reaction here.
         await reactions.success()
 
     async def resolve_topic(self, stream_id: int, topic: str) -> dict[str, Any]:
