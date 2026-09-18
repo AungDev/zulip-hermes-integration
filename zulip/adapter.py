@@ -17,6 +17,7 @@ from typing import Optional, Any, overload
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    ExecApprovalPrompt,
     MessageEvent,
     MessageType,
     SendResult,
@@ -1616,6 +1617,163 @@ class ZulipAdapter(BasePlatformAdapter):
         link = f"![{name}]({url})" if as_image else f"[{name}]({url})"
         content = f"{caption}\n{link}" if caption else link
         return await self.send(chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata)
+
+    # ── Native exec-approval buttons (zform widget) ─────────────────────────
+    # Zulip has no Discord-style component API, but bots can attach a generic
+    # button widget to any message via the `widget_content` send-message param
+    # (zform/choices; the same mechanism the official trivia_bot uses). On
+    # web/desktop each choice renders as a button, and a click makes the CLIENT
+    # send an ordinary message from the clicker with the choice's `reply` as
+    # content. Mapping each reply to the gateway's plain-text approval command
+    # reuses the existing resolution path unchanged: the press IS a typed
+    # `/approve`-family message from the clicker, so authorization is identical,
+    # and slash forms bypass mention gating at the base-adapter guard. Clients
+    # without widget support (mobile, terminals) show only the message text —
+    # the same prompt the gateway's text fallback renders.
+    _EA_ZFORM_REPLY: dict[str, str] = {
+        "once": "/approve",
+        "session": "/approve session",
+        "always": "/approve always",
+        "deny": "/deny",
+    }
+    _EA_ZFORM_INSTRUCTIONS: dict[str, str] = {
+        "once": "`/approve` to execute this one operation",
+        "session": "`/approve session` to approve this pattern for the session",
+        "always": "`/approve always` to approve permanently",
+        "deny": "`/deny` to cancel",
+    }
+
+    def _zform_widget_for_approval(self, prompt: ExecApprovalPrompt) -> Optional[str]:
+        """JSON ``widget_content`` for an exec-approval prompt, or None when the
+        prompt carries no renderable actions.
+
+        Schema per web/src/zform_data.ts (client zod): every choice needs
+        ``type``/``short_name``/``long_name``/``reply`` strings and extra_data a
+        ``heading``. The server validator (check_widget_content) does NOT check
+        the per-choice ``type``, but the web renderer rejects its absence — a
+        payload missing it sends fine and silently renders nothing.
+        """
+        choices: list[dict[str, str]] = []
+        for label, choice, _style in prompt.actions:
+            reply = self._EA_ZFORM_REPLY.get(choice)
+            if not reply:
+                # Unknown choice vocabulary — bail out so the gateway's text
+                # fallback renders instead of a widget that resolves nothing.
+                return None
+            choices.append(
+                {
+                    "type": "multiple_choice",
+                    "short_name": chr(ord("A") + len(choices)) if len(choices) < 26 else "?",
+                    "long_name": str(label),
+                    "reply": reply,
+                }
+            )
+        if not choices:
+            return None
+        return json.dumps(
+            {
+                "widget_type": "zform",
+                "extra_data": {
+                    "type": "choices",
+                    "heading": "Choose an action:",
+                    "choices": choices,
+                },
+            }
+        )
+
+    def _approval_fallback_instructions(self, prompt: ExecApprovalPrompt) -> str:
+        """Plain-text reply instructions mirroring the gateway's text fallback,
+        built from the same action set as the buttons (widget-less clients)."""
+        instructions = [
+            self._EA_ZFORM_INSTRUCTIONS[choice]
+            for _label, choice, _style in prompt.actions
+            if choice in self._EA_ZFORM_INSTRUCTIONS
+        ]
+        if not instructions:
+            return ""
+        if len(instructions) == 1:
+            return f"Reply {instructions[0]}."
+        return "Reply " + ", ".join(instructions[:-1]) + f", or {instructions[-1]}."
+
+    async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
+        """Send the exec-approval prompt as context text + a zform-button message.
+
+        Two messages, because a rendered zform widget REPLACES its own message
+        body on web/desktop (``$outer_elem.empty().append($choices)`` in
+        web/src/zform.ts): context sent as the widget message's text would be
+        invisible exactly where the buttons render. Message 1 = the shared
+        approval text plus reply instructions (visible on every client);
+        message 2 = the button widget. Non-widget clients show both as plain
+        text. Delivered if either message sends — the text alone is the full
+        text-fallback experience — so the runner's plain-text re-send only
+        happens when both fail.
+        """
+        widget_content = self._zform_widget_for_approval(prompt)
+        instructions = self._approval_fallback_instructions(prompt)
+        content = prompt.text if not instructions else f"{prompt.text}\n\n{instructions}"
+        try:
+            target = _parse_target(prompt.chat_id)
+        except Exception as e:
+            logger.error(
+                format_zulip_log(
+                    "zulip approval prompt send error",
+                    chat_id=mask_pii(prompt.chat_id),
+                    error=mask_pii(str(e)),
+                )
+            )
+            return SendResult(success=False, message_id="")
+
+        if target["type"] == "dm":
+            base: dict[str, Any] = {"type": "private", "to": [target["user_id"]]}
+        else:
+            topic = (
+                (prompt.metadata or {}).get("topic")
+                or self._topic_cache.get(prompt.chat_id, "general")
+            )
+            base = {"type": "stream", "to": target["stream_id"], "topic": topic}
+
+        async def _send(request: dict[str, Any]) -> Optional[SendResult]:
+            try:
+                result = await self._sdk_call(
+                    self.client.send_message, request, timeout=self._send_timeout
+                )
+            except Exception as e:
+                logger.error(
+                    format_zulip_log(
+                        "zulip approval prompt send error",
+                        chat_id=mask_pii(prompt.chat_id),
+                        error=mask_pii(str(e)),
+                    )
+                )
+                return None
+            if result.get("result") == "success":
+                logger.debug("zulip approval message sent to %s", mask_pii(prompt.chat_id))
+                return SendResult(success=True, message_id=str(result.get("id", "")))
+            logger.error(
+                format_zulip_log(
+                    "zulip approval prompt send failed",
+                    chat_id=mask_pii(prompt.chat_id),
+                    error=mask_pii(str(result)),
+                )
+            )
+            return None
+
+        context_result = await _send({**base, "content": content})
+        if widget_content is None:
+            return context_result or SendResult(success=False, message_id="")
+
+        widget_result = await _send(
+            {
+                **base,
+                "content": "Choose an action:",
+                "widget_content": widget_content,
+            }
+        )
+        if widget_result is not None:
+            # Last-sent id: the interactive message is the one later tooling
+            # would target (matches SendResult's newest-chunk convention).
+            return widget_result
+        return context_result or SendResult(success=False, message_id="")
 
     async def send(
         self,

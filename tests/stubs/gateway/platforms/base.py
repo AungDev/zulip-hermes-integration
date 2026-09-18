@@ -16,6 +16,25 @@ class SendResult:
 
 
 @dataclass
+class ExecApprovalPrompt:
+    """Mirror of gateway.platforms.base.ExecApprovalPrompt — input to the
+    native-button exec-approval hook (_send_exec_approval_prompt)."""
+
+    chat_id: str
+    session_key: str
+    text: str
+    actions: list = field(default_factory=list)  # rows of (label, choice, style)
+    command: str = ""
+    description: str = ""
+    smart_denied: bool = False
+    metadata: Optional[dict] = None
+
+    @property
+    def choices(self) -> list:
+        return [choice for _, choice, _ in self.actions]
+
+
+@dataclass
 class MessageSource:
     chat_id: str = ""
     chat_name: str = ""
