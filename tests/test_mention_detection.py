@@ -208,13 +208,20 @@ class TestAcknowledgementOrdering:
         )
 
     @pytest.mark.asyncio
-    async def test_accepted_message_does_send_typing(self, adapter, monkeypatch):
+    async def test_accepted_message_leaves_typing_to_core_hooks(self, adapter, monkeypatch):
+        # The gateway core owns typing during an agent run: its keep-typing
+        # loop calls send_typing()/stop_typing() on the adapter every ~2s and
+        # stops when the run finishes. The message flow itself must NOT emit
+        # typing calls — handle_message() returns as soon as the background
+        # agent task is spawned, so a manual start here only lasted
+        # ZULIP_TYPING_DELAY_SECONDS and then fought the core loop's refresh.
         monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
         monkeypatch.delenv("ZULIP_STREAM_OVERRIDES", raising=False)
         await adapter._handle_message(self._msg("hello"))
         adapter.handle_message.assert_called_once()
-        assert self._typing_calls(adapter), (
-            "an accepted message should still show a typing indicator"
+        assert self._typing_calls(adapter) == [], (
+            "the message flow must not manage typing itself; the core "
+            "keep-typing loop drives the send_typing/stop_typing hooks"
         )
 
 
