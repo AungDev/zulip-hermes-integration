@@ -476,12 +476,27 @@ def _metadata_topic(metadata: Any) -> Optional[str]:
 def _stable_topic_sessions_enabled() -> bool:
     """Whether topic sessions key on a stable conversation id (rename-proof).
 
-    Off by default; requires ``ZULIP_TOPIC_SESSIONS=true`` to have effect.
-    When enabled, the adapter mints an opaque conversation id per topic
-    conversation and keeps it stable across topic renames (see
-    ``zulip/conversations.py`` and the project DESIGN.md).
+    **On by default** whenever ``ZULIP_TOPIC_SESSIONS=true`` — users expect a
+    renamed topic to continue its session (Discord/Telegram/Slack threads all
+    behave that way natively; Zulip topics are name-only strings, so the
+    adapter mints the stable identity itself). Set
+    ``ZULIP_STABLE_TOPIC_SESSIONS=false`` to opt out and keep legacy
+    name-keyed sessions (existing sessions in the gateway state remain
+    reachable under their old keys).
+
+    Enabling it re-keys topic sessions once (each topic's next message mints
+    a conversation id and starts a fresh session); see the project DESIGN.md.
     """
-    return os.getenv("ZULIP_STABLE_TOPIC_SESSIONS", "").strip().lower() in ("true", "1", "yes", "on")
+    raw = os.getenv("ZULIP_STABLE_TOPIC_SESSIONS", "").strip().lower()
+    return raw not in ("false", "0", "no", "off")
+
+
+def _stable_topic_sessions_explicitly_set() -> bool:
+    """True when the operator explicitly asked for stable sessions (any
+    truthy value). Used only for the misconfiguration warning — an unset
+    variable means "default", which must not warn on its own."""
+    raw = os.getenv("ZULIP_STABLE_TOPIC_SESSIONS", "").strip().lower()
+    return raw in ("true", "1", "yes", "on")
 
 
 def _topic_sessions_enabled() -> bool:
@@ -619,21 +634,21 @@ class ZulipAdapter(BasePlatformAdapter):
         self._dedupe.load()
 
         # Stable topic sessions: mint persistent conversation ids per topic
-        # conversation so Hermes sessions survive topic renames. Constructed
-        # only when enabled — when off, the registry is never consulted or
-        # written (zero behavior change).
+        # conversation so Hermes sessions survive topic renames. On by
+        # default when topic sessions are enabled; explicit opt-out restores
+        # legacy name-keyed sessions. When disabled, the registry is never
+        # consulted or written (zero behavior change).
         self._conversations: Optional[TopicConversationRegistry] = None
-        if _stable_topic_sessions_enabled():
-            if not _topic_sessions_enabled():
-                logger.warning(
-                    "ZULIP_STABLE_TOPIC_SESSIONS has no effect without"
-                    " ZULIP_TOPIC_SESSIONS=true"
-                )
-            else:
-                self._conversations = TopicConversationRegistry(
-                    account_id=self.email or "default",
-                    data_dir=self._data_dir,
-                )
+        if _topic_sessions_enabled() and _stable_topic_sessions_enabled():
+            self._conversations = TopicConversationRegistry(
+                account_id=self.email or "default",
+                data_dir=self._data_dir,
+            )
+        elif _stable_topic_sessions_explicitly_set() and not _topic_sessions_enabled():
+            logger.warning(
+                "ZULIP_STABLE_TOPIC_SESSIONS has no effect without"
+                " ZULIP_TOPIC_SESSIONS=true"
+            )
 
         # Reaction config
         self._reaction_cfg = ReactionConfig.from_env()

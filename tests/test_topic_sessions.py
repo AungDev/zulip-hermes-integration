@@ -28,6 +28,10 @@ class TestTopicScoping:
     def adapter(self, mock_platform_config, monkeypatch):
         import zulip.adapter as adapter_module
         monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
+        # This suite tests the legacy name-keyed scoping of the flag itself;
+        # stable conversation-id keying has its own suite
+        # (test_stable_topic_sessions.py).
+        monkeypatch.setenv("ZULIP_STABLE_TOPIC_SESSIONS", "false")
 
         class MockZulipModule:
             class Client:
