@@ -79,10 +79,10 @@ def _rename_event(
 
 @pytest.fixture
 def adapter(mock_platform_config, monkeypatch, tmp_path):
-    """ZulipAdapter with stable topic sessions ON and a recording client."""
+    """ZulipAdapter with topic sessions on (conversation-id keyed, the only
+mode) and a recording client."""
     monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
     monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "true")
-    monkeypatch.setenv("ZULIP_STABLE_TOPIC_SESSIONS", "true")
     monkeypatch.setenv("HERMES_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
 
@@ -324,84 +324,3 @@ class TestContinueCommand:
         )
         cmd_call = adapter.client._client._sent_messages[0]
         assert "No recently renamed conversation" in cmd_call["content"]
-
-
-class TestFlagOff:
-    """Explicit opt-out (ZULIP_STABLE_TOPIC_SESSIONS=false): behavior is
-    identical to legacy name-keyed sessions (no registry)."""
-
-    @pytest.fixture
-    def adapter_unstable(self, mock_platform_config, monkeypatch, tmp_path):
-        monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
-        monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "true")
-        monkeypatch.setenv("ZULIP_STABLE_TOPIC_SESSIONS", "false")
-        monkeypatch.setenv("HERMES_DATA_DIR", str(tmp_path))
-        monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
-
-        class MockZulipModule:
-            class Client:
-                def __init__(self, **kwargs):
-                    self._client = RecordingTypingClient(**kwargs)
-
-                def __getattr__(self, name):
-                    return getattr(self._client, name)
-
-        monkeypatch.setattr(adapter_module, "zulip", MockZulipModule())
-        from zulip.adapter import ZulipAdapter
-
-        a = ZulipAdapter(mock_platform_config)
-        a.email = "bot@zulip.com"
-        a.handle_message = AsyncMock()
-        return a
-
-    @pytest.mark.asyncio
-    async def test_session_keyed_by_topic_name(self, adapter_unstable):
-        assert adapter_unstable._conversations is None
-        await adapter_unstable._handle_message(_stream_msg("deploys", msg_id=1))
-        source = adapter_unstable.handle_message.call_args[0][0].source
-        assert source.thread_id == "deploys"
-
-    @pytest.mark.asyncio
-    async def test_rename_events_ignored(self, adapter_unstable):
-        adapter_unstable._handle_topic_update(
-            _rename_event("deploys", "deploys-2")
-        )  # must be a no-op, not a crash
-        await adapter_unstable._handle_message(_stream_msg("deploys-2", msg_id=1))
-        source = adapter_unstable.handle_message.call_args[0][0].source
-        assert source.thread_id == "deploys-2"  # plain name keying
-
-
-class TestDefaultOn:
-    """Stable sessions are the DEFAULT when ZULIP_TOPIC_SESSIONS=true —
-    users expect a renamed topic to continue its session."""
-
-    @pytest.fixture
-    def adapter_default(self, mock_platform_config, monkeypatch, tmp_path):
-        monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
-        monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "true")
-        monkeypatch.delenv("ZULIP_STABLE_TOPIC_SESSIONS", raising=False)
-        monkeypatch.setenv("HERMES_DATA_DIR", str(tmp_path))
-        monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
-
-        class MockZulipModule:
-            class Client:
-                def __init__(self, **kwargs):
-                    self._client = RecordingTypingClient(**kwargs)
-
-                def __getattr__(self, name):
-                    return getattr(self._client, name)
-
-        monkeypatch.setattr(adapter_module, "zulip", MockZulipModule())
-        from zulip.adapter import ZulipAdapter
-
-        a = ZulipAdapter(mock_platform_config)
-        a.email = "bot@zulip.com"
-        a.handle_message = AsyncMock()
-        return a
-
-    @pytest.mark.asyncio
-    async def test_unset_flag_defaults_to_conversation_ids(self, adapter_default):
-        assert adapter_default._conversations is not None
-        await adapter_default._handle_message(_stream_msg("deploys", msg_id=1))
-        source = adapter_default.handle_message.call_args[0][0].source
-        assert source.thread_id.startswith("c")

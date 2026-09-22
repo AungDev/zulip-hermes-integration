@@ -25,13 +25,13 @@ class TestTopicSessionsFlag:
 
 class TestTopicScoping:
     @pytest.fixture
-    def adapter(self, mock_platform_config, monkeypatch):
+    def make_adapter(self, mock_platform_config, monkeypatch, tmp_path):
+        """Adapter factory — the registry is built at construction time, so
+        ZULIP_TOPIC_SESSIONS must be set before ZulipAdapter() is created."""
         import zulip.adapter as adapter_module
         monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
-        # This suite tests the legacy name-keyed scoping of the flag itself;
-        # stable conversation-id keying has its own suite
-        # (test_stable_topic_sessions.py).
-        monkeypatch.setenv("ZULIP_STABLE_TOPIC_SESSIONS", "false")
+        monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
+        monkeypatch.setenv("HERMES_DATA_DIR", str(tmp_path))
 
         class MockZulipModule:
             class Client:
@@ -40,10 +40,15 @@ class TestTopicScoping:
 
         monkeypatch.setattr(adapter_module, "zulip", MockZulipModule())
         from zulip.adapter import ZulipAdapter
-        a = ZulipAdapter(mock_platform_config)
-        a.email = "bot@zulip.com"
-        a.handle_message = AsyncMock()
-        return a
+
+        def _make(topic_sessions: str):
+            monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", topic_sessions)
+            a = ZulipAdapter(mock_platform_config)
+            a.email = "bot@zulip.com"
+            a.handle_message = AsyncMock()
+            return a
+
+        return _make
 
     def _stream_msg(self, topic: str) -> dict:
         return {
@@ -69,45 +74,43 @@ class TestTopicScoping:
         }
 
     @pytest.mark.asyncio
-    async def test_topic_not_used_for_session_by_default(self, adapter, monkeypatch):
-        monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
-        monkeypatch.delenv("ZULIP_TOPIC_SESSIONS", raising=False)
+    async def test_topic_not_used_for_session_by_default(self, make_adapter):
+        adapter = make_adapter("false")
         await adapter._handle_message(self._stream_msg("deploys"))
         source = adapter.handle_message.call_args[0][0].source
         assert not getattr(source, "thread_id", "")
 
     @pytest.mark.asyncio
-    async def test_topic_scopes_session_when_enabled(self, adapter, monkeypatch):
-        monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
-        monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "true")
+    async def test_topic_scopes_session_when_enabled(self, make_adapter):
+        adapter = make_adapter("true")
         await adapter._handle_message(self._stream_msg("deploys"))
         source = adapter.handle_message.call_args[0][0].source
-        assert source.thread_id == "deploys"
+        # Sessions key on the minted conversation id, not the topic name.
+        assert source.thread_id.startswith("c")
 
     @pytest.mark.asyncio
-    async def test_different_topics_get_different_thread_ids(self, adapter, monkeypatch):
-        monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
-        monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "true")
+    async def test_different_topics_get_different_thread_ids(self, make_adapter):
+        adapter = make_adapter("true")
         await adapter._handle_message(self._stream_msg("deploys"))
         first = adapter.handle_message.call_args[0][0].source
         await adapter._handle_message(self._stream_msg("incidents"))
         second = adapter.handle_message.call_args[0][0].source
-        assert first.thread_id == "deploys"
-        assert second.thread_id == "incidents"
+        assert first.thread_id != second.thread_id
+        assert first.thread_id.startswith("c")
+        assert second.thread_id.startswith("c")
         # Same stream, so the chat_id is shared — only the thread differs.
         assert first.chat_id == second.chat_id
 
     @pytest.mark.asyncio
-    async def test_empty_topic_does_not_set_thread_id(self, adapter, monkeypatch):
-        monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
-        monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "true")
+    async def test_empty_topic_does_not_set_thread_id(self, make_adapter):
+        adapter = make_adapter("true")
         await adapter._handle_message(self._stream_msg(""))
         source = adapter.handle_message.call_args[0][0].source
         assert not getattr(source, "thread_id", "")
 
     @pytest.mark.asyncio
-    async def test_dms_are_unaffected(self, adapter, monkeypatch):
-        monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "true")
+    async def test_dms_are_unaffected(self, make_adapter):
+        adapter = make_adapter("true")
         await adapter._handle_message(self._dm())
         source = adapter.handle_message.call_args[0][0].source
         assert source.chat_type == "dm"

@@ -473,32 +473,6 @@ def _metadata_topic(metadata: Any) -> Optional[str]:
     return None
 
 
-def _stable_topic_sessions_enabled() -> bool:
-    """Whether topic sessions key on a stable conversation id (rename-proof).
-
-    **On by default** whenever ``ZULIP_TOPIC_SESSIONS=true`` — users expect a
-    renamed topic to continue its session (Discord/Telegram/Slack threads all
-    behave that way natively; Zulip topics are name-only strings, so the
-    adapter mints the stable identity itself). Set
-    ``ZULIP_STABLE_TOPIC_SESSIONS=false`` to opt out and keep legacy
-    name-keyed sessions (existing sessions in the gateway state remain
-    reachable under their old keys).
-
-    Enabling it re-keys topic sessions once (each topic's next message mints
-    a conversation id and starts a fresh session); see the project DESIGN.md.
-    """
-    raw = os.getenv("ZULIP_STABLE_TOPIC_SESSIONS", "").strip().lower()
-    return raw not in ("false", "0", "no", "off")
-
-
-def _stable_topic_sessions_explicitly_set() -> bool:
-    """True when the operator explicitly asked for stable sessions (any
-    truthy value). Used only for the misconfiguration warning — an unset
-    variable means "default", which must not warn on its own."""
-    raw = os.getenv("ZULIP_STABLE_TOPIC_SESSIONS", "").strip().lower()
-    return raw in ("true", "1", "yes", "on")
-
-
 def _topic_sessions_enabled() -> bool:
     """Whether each Zulip topic should get its own conversation session.
 
@@ -633,21 +607,16 @@ class ZulipAdapter(BasePlatformAdapter):
         )
         self._dedupe.load()
 
-        # Stable topic sessions: mint persistent conversation ids per topic
-        # conversation so Hermes sessions survive topic renames. On by
-        # default when topic sessions are enabled; explicit opt-out restores
-        # legacy name-keyed sessions. When disabled, the registry is never
-        # consulted or written (zero behavior change).
+        # Stable topic sessions: with topic sessions enabled, sessions key on
+        # a persistent conversation id — never the topic name — so renames
+        # continue the session instead of stranding it. There is no opt-out:
+        # name-keyed topic sessions are not a feature (explicit /new is the
+        # only way to start a fresh session in a topic).
         self._conversations: Optional[TopicConversationRegistry] = None
-        if _topic_sessions_enabled() and _stable_topic_sessions_enabled():
+        if _topic_sessions_enabled():
             self._conversations = TopicConversationRegistry(
                 account_id=self.email or "default",
                 data_dir=self._data_dir,
-            )
-        elif _stable_topic_sessions_explicitly_set() and not _topic_sessions_enabled():
-            logger.warning(
-                "ZULIP_STABLE_TOPIC_SESSIONS has no effect without"
-                " ZULIP_TOPIC_SESSIONS=true"
             )
 
         # Reaction config
@@ -1125,8 +1094,8 @@ class ZulipAdapter(BasePlatformAdapter):
         conversation in the channel (R7). Consumes the tombstone."""
         if self._conversations is None:
             return (
-                "Stable topic sessions are not enabled"
-                " (set ZULIP_STABLE_TOPIC_SESSIONS=true)."
+                "Topic sessions are disabled"
+                " (set ZULIP_TOPIC_SESSIONS=true to enable them)."
             )
         entry = self._conversations.latest_tombstone(stream_id)
         if entry is None:
@@ -1437,20 +1406,18 @@ class ZulipAdapter(BasePlatformAdapter):
                 "user_id": sender_email,
                 "user_name": sender_full_name,
             }
-            if topic and _topic_sessions_enabled():
-                conversation_id: Optional[str] = None
-                if self._conversations is not None and isinstance(stream_id, int):
-                    # Stable topic sessions: key the session on a
-                    # rename-proof conversation id, not the topic name.
-                    conversation_id = self._conversations.resolve(
+            if topic and self._conversations is not None:
+                # Sessions key on a rename-proof conversation id — never the
+                # topic name. Renames must not strand or fabricate sessions;
+                # /new is the only way to start a fresh session in a topic.
+                if isinstance(stream_id, int):
+                    source_kwargs["thread_id"] = self._conversations.resolve(
                         stream_id,
                         topic,
                         anchor_message_id=int(message_id) if message_id else None,
                     )
-                if conversation_id is not None:
-                    source_kwargs["thread_id"] = conversation_id
-                else:
-                    source_kwargs["thread_id"] = topic
+                # Malformed stream_id: no thread_id → degrades to the
+                # per-stream session (unreachable for well-formed events).
             source = self.build_source(**source_kwargs)
             extra_meta = {"topic": topic, "stream_id": stream_id}
         else:
