@@ -52,7 +52,8 @@ from .queue_manager import ZulipQueueManager
 from .dedupe_store import ZulipDedupeStore
 from .reactions import ReactionConfig, ReactionLifecycle
 from .version import __version__, __repo__
-from .commands import handle_command, is_command
+from .commands import CommandResult, handle_command, is_command
+from .conversations import TopicConversationRegistry
 from .policy import PolicyEngine
 from . import updater
 from .probe import probe_zulip, _normalize_base_url
@@ -472,6 +473,17 @@ def _metadata_topic(metadata: Any) -> Optional[str]:
     return None
 
 
+def _stable_topic_sessions_enabled() -> bool:
+    """Whether topic sessions key on a stable conversation id (rename-proof).
+
+    Off by default; requires ``ZULIP_TOPIC_SESSIONS=true`` to have effect.
+    When enabled, the adapter mints an opaque conversation id per topic
+    conversation and keeps it stable across topic renames (see
+    ``zulip/conversations.py`` and the project DESIGN.md).
+    """
+    return os.getenv("ZULIP_STABLE_TOPIC_SESSIONS", "").strip().lower() in ("true", "1", "yes", "on")
+
+
 def _topic_sessions_enabled() -> bool:
     """Whether each Zulip topic should get its own conversation session.
 
@@ -595,7 +607,7 @@ class ZulipAdapter(BasePlatformAdapter):
             account_id=self.email or "default",
             data_dir=self._data_dir,
             register_fn=lambda: self.client.register(
-                event_types=["message"], fetch_event_id=0
+                event_types=["message", "update_message"], fetch_event_id=0
             ),
         )
         self._dedupe = ZulipDedupeStore(
@@ -605,6 +617,23 @@ class ZulipAdapter(BasePlatformAdapter):
             max_size=2000,
         )
         self._dedupe.load()
+
+        # Stable topic sessions: mint persistent conversation ids per topic
+        # conversation so Hermes sessions survive topic renames. Constructed
+        # only when enabled — when off, the registry is never consulted or
+        # written (zero behavior change).
+        self._conversations: Optional[TopicConversationRegistry] = None
+        if _stable_topic_sessions_enabled():
+            if not _topic_sessions_enabled():
+                logger.warning(
+                    "ZULIP_STABLE_TOPIC_SESSIONS has no effect without"
+                    " ZULIP_TOPIC_SESSIONS=true"
+                )
+            else:
+                self._conversations = TopicConversationRegistry(
+                    account_id=self.email or "default",
+                    data_dir=self._data_dir,
+                )
 
         # Reaction config
         self._reaction_cfg = ReactionConfig.from_env()
@@ -703,7 +732,7 @@ class ZulipAdapter(BasePlatformAdapter):
         runs (platform typing state expires after ~5s). Best-effort."""
         try:
             params = self._typing_params_for_chat(
-                str(chat_id), "start", topic=_metadata_topic(metadata)
+                str(chat_id), "start", topic=self._routed_topic_for_chat(str(chat_id), metadata)
             )
             if params:
                 await self._sdk_call(
@@ -723,7 +752,7 @@ class ZulipAdapter(BasePlatformAdapter):
         """
         try:
             params = self._typing_params_for_chat(
-                str(chat_id), "stop", topic=_metadata_topic(metadata)
+                str(chat_id), "stop", topic=self._routed_topic_for_chat(str(chat_id), metadata)
             )
             if params:
                 await self._sdk_call(
@@ -978,6 +1007,10 @@ class ZulipAdapter(BasePlatformAdapter):
                         # Per-session serialization is handled by the gateway.
                         task = asyncio.create_task(self._handle_message(msg))
                         processing_tasks.append(task)
+                    elif event.get("type") == "update_message":
+                        # Topic renames/moves: registry maintenance for stable
+                        # topic sessions. Fast + ordered, handled inline.
+                        self._handle_topic_update(event)
 
                 # Fire-and-forget: don't await processing tasks here so the
                 # poll loop keeps fetching events. Errors are logged inside
@@ -997,6 +1030,102 @@ class ZulipAdapter(BasePlatformAdapter):
                     )
                 )
                 await asyncio.sleep(5)
+
+    def _handle_topic_update(self, event: dict) -> None:
+        """Registry maintenance for topic renames/moves (stable topic sessions).
+
+        Implements R2/R5 (full rename re-points and frees the old name), R3
+        (partial moves are splits: no registry change) and R8 (cross-channel
+        moves free the mapping). Never raises.
+        """
+        if self._conversations is None:
+            return
+        stream_id = event.get("stream_id")
+        orig_subject = event.get("orig_subject")
+        subject = event.get("subject")
+        propagate_mode = event.get("propagate_mode", "")
+        try:
+            if not isinstance(stream_id, int) or not orig_subject:
+                return  # content-only edit or malformed event
+            if event.get("new_stream_id") is not None:
+                # R8: messages moved to a different channel — free the old
+                # mapping here; the new location becomes a fresh conversation.
+                freed = self._conversations.free(stream_id, orig_subject)
+                if freed:
+                    logger.debug(
+                        "zulip conversation freed on cross-channel move"
+                        " [channel=%s conv=%s]",
+                        stream_id, freed,
+                    )
+                return
+            if not subject or subject == orig_subject:
+                return  # same-topic touch (e.g. content edit)
+            if propagate_mode == "change_all":
+                # R2: full rename — the conversation moves to the new name;
+                # the old name is freed (tombstoned).
+                moved = self._conversations.repoint(stream_id, orig_subject, subject)
+                if moved:
+                    logger.debug(
+                        "zulip conversation repointed [channel=%s conv=%s"
+                        " old=%r new=%r]",
+                        stream_id, moved, mask_pii(orig_subject), mask_pii(subject),
+                    )
+            # R3: change_one/change_later are splits — the new name resolves
+            # to a new conversation via R1 on its next message.
+        except Exception as e:
+            logger.warning(
+                format_zulip_log(
+                    "zulip topic registry update failed",
+                    error=mask_pii(str(e)),
+                )
+            )
+
+    def _routed_topic(self, stream_id: int, metadata: Any) -> Optional[str]:
+        """Routing topic from send metadata, resolving conversation ids.
+
+        With stable topic sessions, ``metadata["thread_id"]`` carries a
+        conversation id; map it to the conversation's CURRENT topic name (R6 —
+        an in-flight reply after a rename lands in the new name). Unknown ids
+        and registry-less runs return the raw value (legacy name-keyed
+        sessions keep working verbatim).
+        """
+        raw = _metadata_topic(metadata)
+        if raw and self._conversations is not None:
+            try:
+                current = self._conversations.current_name(int(stream_id), raw)
+            except (TypeError, ValueError):
+                current = None
+            if current:
+                return current
+        return raw
+
+    def _routed_topic_for_chat(self, chat_id: str, metadata: Any) -> Optional[str]:
+        """``_routed_topic`` for chat-id strings (typing hooks)."""
+        if not chat_id.isdigit():
+            return _metadata_topic(metadata)
+        return self._routed_topic(int(chat_id), metadata)
+
+    def _continue_command_reply(self, stream_id: int, topic: str) -> str:
+        """``/continue``: re-bind this topic to the most recently renamed
+        conversation in the channel (R7). Consumes the tombstone."""
+        if self._conversations is None:
+            return (
+                "Stable topic sessions are not enabled"
+                " (set ZULIP_STABLE_TOPIC_SESSIONS=true)."
+            )
+        entry = self._conversations.latest_tombstone(stream_id)
+        if entry is None:
+            return "No recently renamed conversation found in this channel."
+        conversation_id, old_name = entry
+        self._conversations.rebind(stream_id, topic, conversation_id)
+        logger.debug(
+            "zulip conversation rebound via /continue [channel=%s conv=%s topic=%r]",
+            stream_id, conversation_id, mask_pii(topic),
+        )
+        return (
+            f"🔗 This topic is now bound to the conversation previously at"
+            f" **{old_name}** — the session continues here."
+        )
 
     async def _handle_message(self, message: dict):
         """Process incoming Zulip message."""
@@ -1184,13 +1313,27 @@ class ZulipAdapter(BasePlatformAdapter):
                 cmd_chat_id = f"dm:{message.get('sender_id', '')}"
                 cmd_topic = None
 
-            cmd_result = handle_command(
-                content=content,
-                chat_id=cmd_chat_id,
-                sender_email=sender_email,
-                sender_name=sender_full_name,
-                version=__version__,
-            )
+            # /continue (stable topic sessions): manually re-bind this topic
+            # to the most recently renamed conversation in this channel.
+            if (
+                self._conversations is not None
+                and msg_type == "stream"
+                and content.strip().lower() == "/continue"
+            ):
+                cmd_result = CommandResult(
+                    handled=True,
+                    reply=self._continue_command_reply(
+                        int(message.get("stream_id") or 0), cmd_topic or ""
+                    ),
+                )
+            else:
+                cmd_result = handle_command(
+                    content=content,
+                    chat_id=cmd_chat_id,
+                    sender_email=sender_email,
+                    sender_name=sender_full_name,
+                    version=__version__,
+                )
             if cmd_result.handled:
                 # Send command reply directly
                 try:
@@ -1280,7 +1423,19 @@ class ZulipAdapter(BasePlatformAdapter):
                 "user_name": sender_full_name,
             }
             if topic and _topic_sessions_enabled():
-                source_kwargs["thread_id"] = topic
+                conversation_id: Optional[str] = None
+                if self._conversations is not None and isinstance(stream_id, int):
+                    # Stable topic sessions: key the session on a
+                    # rename-proof conversation id, not the topic name.
+                    conversation_id = self._conversations.resolve(
+                        stream_id,
+                        topic,
+                        anchor_message_id=int(message_id) if message_id else None,
+                    )
+                if conversation_id is not None:
+                    source_kwargs["thread_id"] = conversation_id
+                else:
+                    source_kwargs["thread_id"] = topic
             source = self.build_source(**source_kwargs)
             extra_meta = {"topic": topic, "stream_id": stream_id}
         else:
@@ -1774,9 +1929,10 @@ class ZulipAdapter(BasePlatformAdapter):
             base: dict[str, Any] = {"type": "private", "to": [target["user_id"]]}
         else:
             # prompt.metadata carries the turn's routing metadata (thread_id =
-            # the session's topic) from the runner; the cache is only a fallback.
-            topic = _metadata_topic(prompt.metadata) or self._topic_cache.get(
-                prompt.chat_id, "general"
+            # a conversation id with stable topic sessions, else the topic
+            # name); the cache is only a fallback.
+            topic = self._routed_topic(target["stream_id"], prompt.metadata) or (
+                self._topic_cache.get(prompt.chat_id, "general")
             )
             base = {"type": "stream", "to": target["stream_id"], "topic": topic}
 
@@ -1926,7 +2082,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
             else:
                 stream_id = target["stream_id"]
-                topic = topic_override or _metadata_topic(metadata)
+                topic = topic_override or self._routed_topic(stream_id, metadata)
                 if not topic:
                     topic = self._topic_cache.get(chat_id, "general")
 
