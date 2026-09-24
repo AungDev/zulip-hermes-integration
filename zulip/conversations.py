@@ -229,15 +229,45 @@ class TopicConversationRegistry:
 
     # -- R7 ----------------------------------------------------------------
 
-    def latest_tombstone(self, channel_id: int) -> Optional[Tuple[str, str]]:
-        """Most recently freed conversation in a channel: (id, old_name)."""
+    def lookup(self, channel_id: int, topic_name: str) -> Optional[str]:
+        """Read-only mapping check: conversation id for a topic name, or None.
+
+        Unlike :meth:`resolve`, never mints or writes.
+        """
         with self._lock:
             row = self._conn.execute(
-                "SELECT conversation_id, topic_name FROM tombstones"
-                " WHERE account_id=? AND channel_id=?"
-                " ORDER BY freed_at DESC LIMIT 1",
-                (self.account_id, channel_id),
+                "SELECT conversation_id FROM topic_map"
+                " WHERE account_id=? AND channel_id=? AND topic_name=?",
+                (self.account_id, channel_id, topic_name),
             ).fetchone()
+            return str(row[0]) if row is not None else None
+
+    def latest_tombstone(
+        self, channel_id: int, exclude_conversation: Optional[str] = None
+    ) -> Optional[Tuple[str, str]]:
+        """Most recently freed conversation in a channel: (id, old_name).
+
+        ``exclude_conversation`` skips tombstones of a conversation the
+        caller is already bound to. Needed for the R5 displacement case:
+        the freshest tombstone there belongs to the *renaming* conversation
+        (its freed old name) — a no-op candidate for ``/continue`` — while
+        the displaced conversation sits right behind it.
+        """
+        with self._lock:
+            if exclude_conversation is not None:
+                row = self._conn.execute(
+                    "SELECT conversation_id, topic_name FROM tombstones"
+                    " WHERE account_id=? AND channel_id=? AND conversation_id != ?"
+                    " ORDER BY freed_at DESC LIMIT 1",
+                    (self.account_id, channel_id, exclude_conversation),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT conversation_id, topic_name FROM tombstones"
+                    " WHERE account_id=? AND channel_id=?"
+                    " ORDER BY freed_at DESC LIMIT 1",
+                    (self.account_id, channel_id),
+                ).fetchone()
             return (str(row[0]), str(row[1])) if row is not None else None
 
     def rebind(self, channel_id: int, topic_name: str, conversation_id: str) -> None:

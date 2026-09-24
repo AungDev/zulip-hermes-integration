@@ -172,6 +172,18 @@ class TestRegistryStore:
         assert reg_b.resolve(7, "deploys") != conv_a
 
 
+    def test_latest_tombstone_excludes_current_conversation(self, registry):
+        conv_a = registry.resolve(7, "TopicA")
+        conv_b = registry.resolve(7, "TopicB")
+        registry.repoint(7, "TopicA", "TopicB")  # R5 collision: conv_a takes "TopicB"
+        # Freshest tombstone is the renaming conversation's old name (a
+        # no-op candidate for /continue in "TopicB"); excluding it surfaces
+        # the DISPLACED conversation instead.
+        latest = registry.latest_tombstone(7)
+        assert latest == (conv_a, "TopicA")
+        assert registry.latest_tombstone(7, exclude_conversation=conv_a) == (conv_b, "TopicB")
+
+
 class TestInboundSessionIdentity:
     """Inbound messages key sessions on the conversation id (R1)."""
 
@@ -324,3 +336,30 @@ class TestContinueCommand:
         )
         cmd_call = adapter.client._client._sent_messages[0]
         assert "No recently renamed conversation" in cmd_call["content"]
+
+    @pytest.mark.asyncio
+    async def test_continue_repairs_displaced_conversation_after_collision(self, adapter):
+        await adapter._handle_message(_stream_msg("TopicA", msg_id=1))
+        conv_a = adapter.handle_message.call_args[0][0].source.thread_id
+        await adapter._handle_message(_stream_msg("TopicB", msg_id=2))
+        conv_b = adapter.handle_message.call_args[0][0].source.thread_id
+        # R5 collision: rename TopicA onto the live TopicB name.
+        adapter._handle_topic_update(_rename_event("TopicA", "TopicB"))
+        # /continue in TopicB must reach the DISPLACED conversation (conv_b),
+        # not the renaming conversation's old-name tombstone (a no-op).
+        await adapter._handle_message(
+            _stream_msg("TopicB", msg_id=3, content="/continue")
+        )
+        cmd_call = adapter.client._client._sent_messages[0]
+        assert "TopicB" in cmd_call["content"]  # confirmation names the tombstone
+        await adapter._handle_message(_stream_msg("TopicB", msg_id=4))
+        rebound = adapter.handle_message.call_args[0][0].source.thread_id
+        assert rebound == conv_b  # TopicB's old session restored
+        # /continue toggles back to the renaming conversation (2-way cycle).
+        await adapter._handle_message(
+            _stream_msg("TopicB", msg_id=5, content="/continue")
+        )
+        await adapter._handle_message(_stream_msg("TopicB", msg_id=6))
+        toggled = adapter.handle_message.call_args[0][0].source.thread_id
+        assert toggled == conv_a
+

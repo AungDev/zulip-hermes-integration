@@ -1097,7 +1097,10 @@ class ZulipAdapter(BasePlatformAdapter):
                 "Topic sessions are disabled"
                 " (set ZULIP_TOPIC_SESSIONS=true to enable them)."
             )
-        entry = self._conversations.latest_tombstone(stream_id)
+        current = self._conversations.lookup(stream_id, topic)
+        entry = self._conversations.latest_tombstone(
+            stream_id, exclude_conversation=current
+        )
         if entry is None:
             return "No recently renamed conversation found in this channel."
         conversation_id, old_name = entry
