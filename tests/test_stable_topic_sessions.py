@@ -206,6 +206,24 @@ class TestRegistryStore:
         assert {str(r[0]) for r in rows} == {conv_d, conv_f, conv_p}
 
 
+    def test_conversation_links_to_at_most_one_topic(self, registry):
+        # Aung's relation model: topic 1—N sessions over time, but a
+        # session belongs to exactly ONE topic at any instant.
+        import sqlite3
+        conv = registry.resolve(7, "TopicA")
+        with pytest.raises(sqlite3.IntegrityError):
+            # Same conversation linked to a second topic name → rejected.
+            registry._conn.execute(
+                "INSERT INTO topic_map"
+                " (account_id, channel_id, topic_name, conversation_id,"
+                "  anchor_message_id, updated_at) VALUES (?,?,?,?,NULL,?)",
+                (registry.account_id, 7, "TopicB", conv, 1.0),
+            )
+        # Different channels are independent topics (same name, own sessions).
+        other_channel = registry.resolve(9, "TopicA")
+        assert other_channel != conv
+
+
 class TestInboundSessionIdentity:
     """Inbound messages key sessions on the conversation id (R1)."""
 

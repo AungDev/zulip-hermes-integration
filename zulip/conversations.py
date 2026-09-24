@@ -65,15 +65,17 @@ class TopicConversationRegistry:
 
     def _init_schema(self) -> None:
         with self._lock, self._conn:
-            # Schema v1: tombstones keyed per CONVERSATION (not per name) —
+            # Schema v2: tombstones keyed per CONVERSATION (not per name) —
             # a name can be freed by different conversations over time
             # (merge chains, R5), and per-name keying silently overwrote
             # earlier tombstones, orphaning conversations beyond repair.
+            # v2 also enforces the topic/session relation: a conversation is
+            # linked to at most ONE topic name per channel at any instant.
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-            if version < 1:
+            if version < 2:
                 self._conn.execute("DROP TABLE IF EXISTS topic_map")
                 self._conn.execute("DROP TABLE IF EXISTS tombstones")
-                self._conn.execute("PRAGMA user_version = 1")
+                self._conn.execute("PRAGMA user_version = 2")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS topic_map (
@@ -85,6 +87,12 @@ class TopicConversationRegistry:
                   updated_at      REAL NOT NULL,
                   PRIMARY KEY (account_id, channel_id, topic_name)
                 )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_topic_map_conversation
+                  ON topic_map (account_id, channel_id, conversation_id)
                 """
             )
             self._conn.execute(
