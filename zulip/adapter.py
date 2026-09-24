@@ -1089,6 +1089,44 @@ class ZulipAdapter(BasePlatformAdapter):
             return _metadata_topic(metadata)
         return self._routed_topic(int(chat_id), metadata)
 
+    def _sessions_command_reply(self, stream_id: int, topic: str) -> str:
+        """``/sessions`` (topic sessions): list this topic's session set.
+
+        Read-only listing: the current session plus every former session
+        (tombstoned member), each labeled with the topic where it was
+        created. Bindings are not changed; ``/continue`` (R7) switches.
+        """
+
+        if self._conversations is None:
+            return (
+                "Topic sessions are disabled"
+                " (set ZULIP_TOPIC_SESSIONS=true to enable them)."
+            )
+        current_id, current_origin, members = self._conversations.sessions_for_topic(
+            stream_id, topic
+        )
+        total = len(members) + (1 if current_id is not None else 0)
+
+        def _short(conversation_id: str) -> str:
+            return conversation_id[:9]
+
+        lines = [f"📋 Sessions for this topic: {total}", ""]
+        if current_id is not None:
+            lines.append(
+                f"▸ `{_short(current_id)}` **(current)**"
+                f' — started in "{current_origin}"'
+            )
+        for member_id, member_origin in members:
+            lines.append(f'◦ `{_short(member_id)}` — started in "{member_origin}"')
+        if members:
+            lines.append("")
+            lines.append("`/continue` switches to the most recent former session.")
+        logger.debug(
+            "zulip /sessions listing [channel=%s topic=%r count=%d]",
+            stream_id, mask_pii(topic), total,
+        )
+        return "\n".join(lines)
+
     def _continue_command_reply(self, stream_id: int, topic: str) -> str:
         """``/continue``: re-bind this topic to the most recently renamed
         conversation in the channel (R7). Consumes the tombstone."""
@@ -1300,16 +1338,24 @@ class ZulipAdapter(BasePlatformAdapter):
                 cmd_chat_id = f"dm:{message.get('sender_id', '')}"
                 cmd_topic = None
 
-            # /continue (stable topic sessions): manually re-bind this topic
-            # to the most recently renamed conversation in this channel.
-            if (
-                self._conversations is not None
-                and msg_type == "stream"
-                and content.strip().lower() == "/continue"
-            ):
+            # /continue and /sessions (stable topic sessions): manual
+            # re-bind, and the read-only listing of this topic's sessions.
+            topic_cmd = (
+                content.strip().lower()
+                if self._conversations is not None and msg_type == "stream"
+                else ""
+            )
+            if topic_cmd == "/continue":
                 cmd_result = CommandResult(
                     handled=True,
                     reply=self._continue_command_reply(
+                        int(message.get("stream_id") or 0), cmd_topic or ""
+                    ),
+                )
+            elif topic_cmd == "/sessions":
+                cmd_result = CommandResult(
+                    handled=True,
+                    reply=self._sessions_command_reply(
                         int(message.get("stream_id") or 0), cmd_topic or ""
                     ),
                 )

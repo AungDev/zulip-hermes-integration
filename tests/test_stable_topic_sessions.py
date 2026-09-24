@@ -15,7 +15,7 @@ Implements the routing rules R1-R8 from the project DESIGN.md:
 """
 
 import shutil
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -224,6 +224,33 @@ class TestRegistryStore:
         assert other_channel != conv
 
 
+    def test_rename_carries_tombstone_membership(self, registry):
+        # R2: the topic's former sessions move along with the rename
+        # (membership tracked by tombstone topic_name; origin unchanged).
+        conv_a = registry.resolve(7, "TopicA")
+        conv_b = registry.resolve(7, "TopicB")
+        registry.repoint(7, "TopicA", "TopicB")
+        current, origin, members = registry.sessions_for_topic(7, "TopicB")
+        assert (current, origin) == (conv_a, "TopicA")
+        assert members == [(conv_b, "TopicB")]
+        registry.repoint(7, "TopicB", "TopicC")
+        current, origin, members = registry.sessions_for_topic(7, "TopicC")
+        assert (current, origin) == (conv_a, "TopicA")
+        assert members == [(conv_b, "TopicB")]  # carried A -> B -> C
+
+    def test_rebind_moves_session_between_topics(self, registry):
+        # The session belongs to exactly one topic: re-binding it to a
+        # different topic moves it, and the old topic keeps it as a
+        # tombstoned former session.
+        conv = registry.resolve(7, "TopicA")
+        registry.rebind(7, "TopicB", conv)
+        assert registry.lookup(7, "TopicB") == conv
+        assert registry.lookup(7, "TopicA") is None
+        current, origin, members = registry.sessions_for_topic(7, "TopicA")
+        assert current is None and origin is None
+        assert members == [(conv, "TopicA")]
+
+
 class TestInboundSessionIdentity:
     """Inbound messages key sessions on the conversation id (R1)."""
 
@@ -421,4 +448,57 @@ class TestContinueCommand:
         )
         await adapter._handle_message(_stream_msg("Discuss about XY", msg_id=11))
         assert adapter.handle_message.call_args[0][0].source.thread_id != conv_p
+
+    @pytest.mark.asyncio
+    async def test_sessions_lists_topic_sessions(self, adapter):
+        for i, name in enumerate(
+            ["Discuss about XY", "Fix XY", "Deploy XY"], start=1
+        ):
+            await adapter._handle_message(_stream_msg(name, msg_id=i))
+        adapter._handle_topic_update(_rename_event("Fix XY", "Discuss about XY"))
+        adapter._handle_topic_update(_rename_event("Deploy XY", "Discuss about XY"))
+        await adapter._handle_message(
+            _stream_msg("Discuss about XY", msg_id=9, content="/sessions")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        assert "Sessions for this topic: 3" in reply
+        assert 'started in "Deploy XY"' in reply
+        assert 'started in "Fix XY"' in reply
+        assert 'started in "Discuss about XY"' in reply
+        assert "(current)" in reply
+        assert "/continue" in reply
+
+    @pytest.mark.asyncio
+    async def test_sessions_passthrough_when_disabled(
+        self, mock_platform_config, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
+        monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "false")
+        monkeypatch.setenv("HERMES_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
+
+        class MockZulipModule:
+            class Client:
+                def __init__(self, **kwargs):
+                    self._client = RecordingTypingClient(**kwargs)
+
+                def __getattr__(self, name):
+                    return getattr(self._client, name)
+
+        monkeypatch.setattr(adapter_module, "zulip", MockZulipModule())
+        core = MagicMock(return_value=MagicMock(handled=True, reply="core-listing"))
+        monkeypatch.setattr(adapter_module, "handle_command", core)
+        from zulip.adapter import ZulipAdapter
+
+        adapter = ZulipAdapter(mock_platform_config)
+        adapter.email = "bot@zulip.com"
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_message(
+            _stream_msg("TopicA", msg_id=1, content="/sessions")
+        )
+        # Not intercepted: the gateway's own /sessions handles it.
+        sent = adapter.client._client._sent_messages
+        assert not any("Sessions for this topic" in str(m) for m in sent)
+        assert core.call_args[1]["content"] == "/sessions"
 
