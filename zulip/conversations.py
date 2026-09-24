@@ -65,6 +65,15 @@ class TopicConversationRegistry:
 
     def _init_schema(self) -> None:
         with self._lock, self._conn:
+            # Schema v1: tombstones keyed per CONVERSATION (not per name) —
+            # a name can be freed by different conversations over time
+            # (merge chains, R5), and per-name keying silently overwrote
+            # earlier tombstones, orphaning conversations beyond repair.
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version < 1:
+                self._conn.execute("DROP TABLE IF EXISTS topic_map")
+                self._conn.execute("DROP TABLE IF EXISTS tombstones")
+                self._conn.execute("PRAGMA user_version = 1")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS topic_map (
@@ -83,10 +92,10 @@ class TopicConversationRegistry:
                 CREATE TABLE IF NOT EXISTS tombstones (
                   account_id      TEXT NOT NULL,
                   channel_id      INTEGER NOT NULL,
-                  topic_name      TEXT NOT NULL,
                   conversation_id TEXT NOT NULL,
+                  topic_name      TEXT NOT NULL,
                   freed_at        REAL NOT NULL,
-                  PRIMARY KEY (account_id, channel_id, topic_name)
+                  PRIMARY KEY (account_id, channel_id, conversation_id)
                 )
                 """
             )
@@ -115,11 +124,9 @@ class TopicConversationRegistry:
                 return str(row[0])
 
             conversation_id = _new_conversation_id()
-            self._conn.execute(
-                "DELETE FROM tombstones"
-                " WHERE account_id=? AND channel_id=? AND topic_name=?",
-                (self.account_id, channel_id, topic_name),
-            )
+            # NOTE: no tombstone purge here. A reused label keeps the old
+            # conversation's tombstone so /continue (R7) can still re-bind
+            # the reused name to it — an explicit human repair after R4.
             self._conn.execute(
                 "INSERT INTO topic_map"
                 " (account_id, channel_id, topic_name, conversation_id,"
@@ -254,18 +261,21 @@ class TopicConversationRegistry:
         the displaced conversation sits right behind it.
         """
         with self._lock:
+            # rowid DESC breaks same-tick freed_at ties deterministically
+            # (later writes — e.g. the orig-name tombstone after a
+            # displacement — sort first).
             if exclude_conversation is not None:
                 row = self._conn.execute(
                     "SELECT conversation_id, topic_name FROM tombstones"
                     " WHERE account_id=? AND channel_id=? AND conversation_id != ?"
-                    " ORDER BY freed_at DESC LIMIT 1",
+                    " ORDER BY freed_at DESC, rowid DESC LIMIT 1",
                     (self.account_id, channel_id, exclude_conversation),
                 ).fetchone()
             else:
                 row = self._conn.execute(
                     "SELECT conversation_id, topic_name FROM tombstones"
                     " WHERE account_id=? AND channel_id=?"
-                    " ORDER BY freed_at DESC LIMIT 1",
+                    " ORDER BY freed_at DESC, rowid DESC LIMIT 1",
                     (self.account_id, channel_id),
                 ).fetchone()
             return (str(row[0]), str(row[1])) if row is not None else None
@@ -304,9 +314,8 @@ class TopicConversationRegistry:
             )
             self._conn.execute(
                 "DELETE FROM tombstones"
-                " WHERE account_id=? AND channel_id=? AND topic_name=?"
-                "   AND conversation_id=?",
-                (self.account_id, channel_id, topic_name, conversation_id),
+                " WHERE account_id=? AND channel_id=? AND conversation_id=?",
+                (self.account_id, channel_id, conversation_id),
             )
 
     # -- R8 ----------------------------------------------------------------

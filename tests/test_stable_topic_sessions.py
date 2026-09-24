@@ -184,6 +184,28 @@ class TestRegistryStore:
         assert registry.latest_tombstone(7, exclude_conversation=conv_a) == (conv_b, "TopicB")
 
 
+    def test_multi_merge_chain_keeps_every_tombstone(self, registry):
+        # Aung's 3-way case: "Fix XY" and "Deploy XY" are merged into the
+        # live "Discuss about XY" (two sequential change_all renames).
+        conv_d = registry.resolve(7, "Discuss about XY")
+        conv_f = registry.resolve(7, "Fix XY")
+        conv_p = registry.resolve(7, "Deploy XY")
+        registry.repoint(7, "Fix XY", "Discuss about XY")     # R5: conv_d displaced
+        registry.repoint(7, "Deploy XY", "Discuss about XY")  # R5: conv_f displaced
+        # Per-conversation tombstone keying: each merge keeps its own row
+        # (per-name keying used to overwrite conv_d's tombstone here).
+        assert registry.current_name(7, conv_p) == "Discuss about XY"
+        assert registry.current_name(7, conv_d) is None
+        assert registry.current_name(7, conv_f) is None
+        assert registry.latest_tombstone(7, exclude_conversation=conv_p) == (
+            conv_f, "Discuss about XY")
+        # All three conversations remain tracked (recoverable via /continue).
+        rows = registry._conn.execute(
+            "SELECT conversation_id FROM tombstones WHERE channel_id=7"
+        ).fetchall()
+        assert {str(r[0]) for r in rows} == {conv_d, conv_f, conv_p}
+
+
 class TestInboundSessionIdentity:
     """Inbound messages key sessions on the conversation id (R1)."""
 
@@ -362,4 +384,23 @@ class TestContinueCommand:
         await adapter._handle_message(_stream_msg("TopicB", msg_id=6))
         toggled = adapter.handle_message.call_args[0][0].source.thread_id
         assert toggled == conv_a
+
+    @pytest.mark.asyncio
+    async def test_multi_merge_then_continue_reaches_recent_conversations(self, adapter):
+        for i, name in enumerate(
+            ["Discuss about XY", "Fix XY", "Deploy XY"], start=1
+        ):
+            await adapter._handle_message(_stream_msg(name, msg_id=i))
+        conv_p = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter._handle_topic_update(_rename_event("Fix XY", "Discuss about XY"))
+        adapter._handle_topic_update(_rename_event("Deploy XY", "Discuss about XY"))
+        # Last renamer wins the name: the live session is Deploy XY's.
+        await adapter._handle_message(_stream_msg("Discuss about XY", msg_id=9))
+        assert adapter.handle_message.call_args[0][0].source.thread_id == conv_p
+        # /continue reaches the most recent OTHER conversation (Fix XY's).
+        await adapter._handle_message(
+            _stream_msg("Discuss about XY", msg_id=10, content="/continue")
+        )
+        await adapter._handle_message(_stream_msg("Discuss about XY", msg_id=11))
+        assert adapter.handle_message.call_args[0][0].source.thread_id != conv_p
 
