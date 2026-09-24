@@ -458,7 +458,7 @@ class TestContinueCommand:
         adapter._handle_topic_update(_rename_event("Fix XY", "Discuss about XY"))
         adapter._handle_topic_update(_rename_event("Deploy XY", "Discuss about XY"))
         await adapter._handle_message(
-            _stream_msg("Discuss about XY", msg_id=9, content="/sessions")
+            _stream_msg("Discuss about XY", msg_id=9, content="/topic-sessions")
         )
         reply = adapter.client._client._sent_messages[0]["content"]
         assert "Sessions for this topic: 3" in reply
@@ -495,9 +495,24 @@ class TestContinueCommand:
         adapter.handle_message = AsyncMock()
 
         await adapter._handle_message(
-            _stream_msg("TopicA", msg_id=1, content="/sessions")
+            _stream_msg("TopicA", msg_id=1, content="/topic-sessions")
         )
-        # Not intercepted: the gateway's own /sessions handles it.
+        # Topic sessions off: the plugin does not own /topic-sessions —
+        # the core handler (mocked) receives it.
+        sent = adapter.client._client._sent_messages
+        assert not any("Sessions for this topic" in str(m) for m in sent)
+        assert core.call_args[1]["content"] == "/topic-sessions"
+
+    @pytest.mark.asyncio
+    async def test_core_sessions_passthrough_when_enabled(self, adapter, monkeypatch):
+        # Disambiguation guarantee: with topic sessions ON, the plugin owns
+        # /topic-sessions and the core gateway keeps /sessions — typing the
+        # core command reaches the core handler untouched.
+        core = MagicMock(return_value=MagicMock(handled=True, reply="core-listing"))
+        monkeypatch.setattr(adapter_module, "handle_command", core)
+        await adapter._handle_message(
+            _stream_msg("Discuss about XY", msg_id=9, content="/sessions")
+        )
         sent = adapter.client._client._sent_messages
         assert not any("Sessions for this topic" in str(m) for m in sent)
         assert core.call_args[1]["content"] == "/sessions"

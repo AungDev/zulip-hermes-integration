@@ -1089,8 +1089,8 @@ class ZulipAdapter(BasePlatformAdapter):
             return _metadata_topic(metadata)
         return self._routed_topic(int(chat_id), metadata)
 
-    def _sessions_command_reply(self, stream_id: int, topic: str) -> str:
-        """``/sessions`` (topic sessions): list this topic's session set.
+    def _topic_sessions_command_reply(self, stream_id: int, topic: str) -> str:
+        """``/topic-sessions`` (topic sessions): list this topic's session set.
 
         Read-only listing: the current session plus every former session
         (tombstoned member), each labeled with the topic where it was
@@ -1122,7 +1122,7 @@ class ZulipAdapter(BasePlatformAdapter):
             lines.append("")
             lines.append("`/continue` switches to the most recent former session.")
         logger.debug(
-            "zulip /sessions listing [channel=%s topic=%r count=%d]",
+            "zulip /topic-sessions listing [channel=%s topic=%r count=%d]",
             stream_id, mask_pii(topic), total,
         )
         return "\n".join(lines)
@@ -1338,7 +1338,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 cmd_chat_id = f"dm:{message.get('sender_id', '')}"
                 cmd_topic = None
 
-            # /continue and /sessions (stable topic sessions): manual
+            # /continue and /topic-sessions (stable topic sessions): manual
             # re-bind, and the read-only listing of this topic's sessions.
             topic_cmd = (
                 content.strip().lower()
@@ -1352,10 +1352,10 @@ class ZulipAdapter(BasePlatformAdapter):
                         int(message.get("stream_id") or 0), cmd_topic or ""
                     ),
                 )
-            elif topic_cmd == "/sessions":
+            elif topic_cmd == "/topic-sessions":
                 cmd_result = CommandResult(
                     handled=True,
-                    reply=self._sessions_command_reply(
+                    reply=self._topic_sessions_command_reply(
                         int(message.get("stream_id") or 0), cmd_topic or ""
                     ),
                 )

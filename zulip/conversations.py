@@ -67,7 +67,7 @@ class TopicConversationRegistry:
         with self._lock, self._conn:
             # Schema v3: adds origin_name to both tables — the topic where
             # a conversation was BORN (set at mint, never renamed). It
-            # labels sessions in the /sessions listing ("started in X")
+            # labels sessions in the /topic-sessions listing ("started in X")
             # while topic_name tracks current membership (carried along
             # on renames). v2 added the per-conversation tombstone key
             # and the topic/session unique index.
@@ -422,7 +422,7 @@ class TopicConversationRegistry:
     def sessions_for_topic(
         self, channel_id: int, topic_name: str
     ) -> Tuple[Optional[str], Optional[str], List[Tuple[str, str]]]:
-        """The topic's session set for the ``/sessions`` listing (read-only).
+        """The topic's session set for the ``/topic-sessions`` listing (read-only).
 
         Returns ``(current_id, current_origin, members)`` where members are
         the tombstoned former sessions of this topic,
