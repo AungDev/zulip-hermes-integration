@@ -341,9 +341,8 @@ class TestRenameEvents:
         assert adapter._conversations.current_name(7, conv) == "deploys"
 
     @pytest.mark.asyncio
-    @pytest.mark.asyncio
     async def test_cross_channel_partial_move_keeps_source_session(self, adapter):
-        # F3 ruling: a PARTIAL move to another channel (change_one) leaves
+        # A PARTIAL move to another channel (change_one) leaves
         # the source topic alive with its remaining messages — it must keep
         # its session. No free, no orphaning.
         await adapter._handle_message(_stream_msg("deploys", msg_id=1))

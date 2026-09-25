@@ -1113,7 +1113,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 # session set has no beneficiary (orphaned). A PARTIAL move
                 # (change_one/change_later) leaves the source topic alive
                 # with its remaining messages — it keeps its session
-                # (R3 semantics; F3 ruling).
+                # (R3 semantics).
                 if propagate_mode == "change_all":
                     freed = self._conversations.free(stream_id, orig_subject)
                     if freed:
