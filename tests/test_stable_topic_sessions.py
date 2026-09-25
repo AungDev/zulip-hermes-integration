@@ -187,7 +187,7 @@ class TestRegistryStore:
 
 
     def test_multi_merge_chain_keeps_every_tombstone(self, registry):
-        # Aung's 3-way case: "Fix XY" and "Deploy XY" are merged into the
+        # Multi-merge case: "Fix XY" and "Deploy XY" are merged into the
         # live "Discuss about XY" (two sequential change_all renames).
         conv_d = registry.resolve(7, "Discuss about XY")
         conv_f = registry.resolve(7, "Fix XY")
@@ -209,7 +209,7 @@ class TestRegistryStore:
 
 
     def test_conversation_links_to_at_most_one_topic(self, registry):
-        # Aung's relation model: topic 1—N sessions over time, but a
+        # Relation model: topic 1—N sessions over time, but a
         # session belongs to exactly ONE topic at any instant.
         import sqlite3
         conv = registry.resolve(7, "TopicA")
