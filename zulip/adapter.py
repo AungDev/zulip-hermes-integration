@@ -1107,15 +1107,21 @@ class ZulipAdapter(BasePlatformAdapter):
             if not isinstance(stream_id, int) or not orig_subject:
                 return  # content-only edit or malformed event
             if event.get("new_stream_id") is not None:
-                # R8: messages moved to a different channel — free the old
-                # mapping here; the new location becomes a fresh conversation.
-                freed = self._conversations.free(stream_id, orig_subject)
-                if freed:
-                    logger.debug(
-                        "zulip conversation freed on cross-channel move"
-                        " [channel=%s conv=%s]",
-                        stream_id, freed,
-                    )
+                # Cross-channel move. Only a FULL move (change_all) empties
+                # the source topic: R8 — free the mapping here; the new
+                # location becomes a fresh conversation, and the freed
+                # session set has no beneficiary (orphaned). A PARTIAL move
+                # (change_one/change_later) leaves the source topic alive
+                # with its remaining messages — it keeps its session
+                # (R3 semantics; F3 ruling).
+                if propagate_mode == "change_all":
+                    freed = self._conversations.free(stream_id, orig_subject)
+                    if freed:
+                        logger.debug(
+                            "zulip conversation freed on cross-channel move"
+                            " [channel=%s conv=%s]",
+                            stream_id, freed,
+                        )
                 return
             if not subject or subject == orig_subject:
                 return  # same-topic touch (e.g. content edit)
