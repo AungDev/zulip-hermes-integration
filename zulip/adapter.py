@@ -567,6 +567,11 @@ class ZulipAdapter(BasePlatformAdapter):
         # topic sessions on, the gateway routes replies by metadata thread_id —
         # the session's own topic — never by this cache.
         self._topic_cache: dict[str, str] = {}
+        # F1: conversation ids resolved at event dispatch, keyed by message
+        # id (str). Written inline by the poll loop in event-id order;
+        # popped by _handle_message so a rename processed between dispatch
+        # and the handler's first await cannot fork the conversation.
+        self._pending_conversations: dict[str, str] = {}
         # Context-mitigation state
         self._last_topic_cache: dict[str, str] = {}      # stream_id → previous topic
         self._message_counts: dict[str, int] = {}        # chat_id → message count
@@ -1004,6 +1009,12 @@ class ZulipAdapter(BasePlatformAdapter):
                         # Process messages concurrently so a slow model call
                         # does not block the poll loop for unrelated messages.
                         # Per-session serialization is handled by the gateway.
+                        # F1 fix: resolve the topic conversation NOW, inline,
+                        # in event-id order — a rename later in this batch (or
+                        # processed while the handler awaits) must not fork
+                        # this message into a fresh conversation under the
+                        # freed name. The id is stashed; the handler reuses it.
+                        self._pre_resolve_conversation(msg, msg_id)
                         task = asyncio.create_task(self._handle_message(msg))
                         processing_tasks.append(task)
                     elif event.get("type") == "update_message":
@@ -1029,6 +1040,49 @@ class ZulipAdapter(BasePlatformAdapter):
                     )
                 )
                 await asyncio.sleep(5)
+
+    def _pre_resolve_conversation(self, msg: dict, msg_id: str) -> None:
+        """Resolve (mint) a stream topic's conversation at event dispatch,
+        in event-id order — the F1 fix.
+
+        `_handle_message` runs as a deferred task, so within one poll batch
+        every inline `update_message` rename applies BEFORE any message
+        task starts, and a rename can also land while a handler sits in a
+        pre-resolve await. Without eager resolution the handler's own
+        `resolve()` would then find the old name freed and mint a fresh
+        conversation under it — forking the topic's session and routing
+        the reply to the resurrected old topic.
+
+        Resolving here, inline in event-id order, makes registry
+        operations strictly follow event order for messages and renames
+        alike; `_handle_message` pops the stashed id instead of
+        re-resolving. Messages later dropped by gating still mint their
+        topic's conversation — harmless: the topic exists, so its
+        conversation exists, and no gateway session is created until a
+        message actually flows. Stash entries are popped at the top of
+        `_handle_message` (before any early return), so nothing lingers.
+        """
+        if self._conversations is None:
+            return
+        if msg.get("type") != "stream":
+            return
+        stream_id = msg.get("stream_id")
+        topic = msg.get("subject", "")
+        if not topic or not isinstance(stream_id, int):
+            return
+        try:
+            conversation_id = self._conversations.resolve(
+                stream_id,
+                topic,
+                anchor_message_id=int(msg_id) if msg_id else None,
+            )
+        except Exception:
+            logger.exception(
+                "zulip pre-dispatch conversation resolve failed [msg=%s]",
+                mask_pii(msg_id),
+            )
+            return
+        self._pending_conversations[msg_id] = conversation_id
 
     def _handle_topic_update(self, event: dict) -> None:
         """Registry maintenance for topic renames/moves (stable topic sessions).
@@ -1254,6 +1308,13 @@ class ZulipAdapter(BasePlatformAdapter):
         msg_type = message.get("type")  # "stream" or "private"
         content = message.get("content", "")
         message_id = message.get("id")
+        # F1: pop the conversation resolved at dispatch (if any) up front —
+        # before any early return — so the stash cannot leak entries.
+        pre_resolved_conversation = (
+            self._pending_conversations.pop(str(message_id), None)
+            if message_id is not None
+            else None
+        )
         sender_email = message.get("sender_email", "")
         sender_full_name = message.get("sender_full_name", "Unknown")
 
@@ -1553,11 +1614,17 @@ class ZulipAdapter(BasePlatformAdapter):
                 # topic name. Renames must not strand or fabricate sessions;
                 # /new is the only way to start a fresh session in a topic.
                 if isinstance(stream_id, int):
-                    source_kwargs["thread_id"] = self._conversations.resolve(
-                        stream_id,
-                        topic,
-                        anchor_message_id=int(message_id) if message_id else None,
-                    )
+                    if pre_resolved_conversation is not None:
+                        # Resolved at dispatch, in event-id order (F1) — a
+                        # rename processed since then must not fork this
+                        # message onto a fresh conversation.
+                        source_kwargs["thread_id"] = pre_resolved_conversation
+                    else:
+                        source_kwargs["thread_id"] = self._conversations.resolve(
+                            stream_id,
+                            topic,
+                            anchor_message_id=int(message_id) if message_id else None,
+                        )
                 # Malformed stream_id: no thread_id → degrades to the
                 # per-stream session (unreachable for well-formed events).
             source = self.build_source(**source_kwargs)

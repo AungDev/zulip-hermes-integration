@@ -14,6 +14,8 @@ Implements the routing rules R1-R8 from the project DESIGN.md:
 - R8: cross-channel moves free the mapping without mapping a new one.
 """
 
+import asyncio
+import contextlib
 import shutil
 import threading
 from dataclasses import dataclass
@@ -607,3 +609,91 @@ class TestLegacySessionMigration:
         adapter._session_store = object()  # incompatible surface
         assert adapter._migrate_legacy_topic_sessions() == 0
 
+
+class TestF1DispatchOrderResolve:
+    """F1: a message event queued before a rename — in the same poll batch
+    or while the handler awaits — must resolve at dispatch, in event-id
+    order. The deferred handler reuses that conversation instead of
+    minting a fresh one under the freed name, so the reply routes to the
+    topic's CURRENT name (the rename's destination), never the resurrected
+    old one."""
+
+    @pytest.mark.asyncio
+    async def test_pre_rename_message_continues_conversation_after_rename(
+        self, adapter
+    ):
+        # 1) The topic already has a conversation.
+        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=30))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+
+        # 2) Dispatch resolves the queued message's conversation inline,
+        #    THEN the rename lands (inline, event-id order) before the
+        #    handler task ever starts.
+        queued = _stream_msg("Deploy XY", msg_id=31)
+        adapter._pre_resolve_conversation(queued, "31")
+        assert adapter._pending_conversations["31"] == conv
+
+        adapter._handle_topic_update(
+            _rename_event("Deploy XY", "Release XY", message_ids=[30, 31])
+        )
+        assert adapter._conversations.current_name(7, conv) == "Release XY"
+
+        # 3) The deferred handler runs: it must reuse the stashed
+        #    conversation — no fresh mint under the freed name.
+        await adapter._handle_message(queued)
+        assert adapter._pending_conversations == {}
+        assert adapter.handle_message.call_args[0][0].source.thread_id == conv
+
+        # 4) The reply routes to the conversation's CURRENT topic name.
+        await adapter.send("7", "reply", metadata={"thread_id": conv})
+        sent = adapter.client._client._sent_messages[-1]
+        assert sent["topic"] == "Release XY"
+
+    @pytest.mark.asyncio
+    async def test_poll_loop_resolves_message_before_same_batch_rename(
+        self, adapter
+    ):
+        """The probe_loop scenario: the REAL _listen_for_events handles one
+        id-ordered batch [message, rename] — the message must key to the
+        topic's existing conversation and the reply must land in the
+        renamed topic."""
+        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=30))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+
+        client = adapter.client._client
+        client.inject_event(
+            {
+                "id": 101,
+                "type": "message",
+                "message": _stream_msg(
+                    "Deploy XY", msg_id=31, content="pre-rename question"
+                ),
+            }
+        )
+        client.inject_event(
+            _rename_event("Deploy XY", "Release XY", message_ids=[30, 31], id=102)
+        )
+
+        adapter._listening = True
+        loop_task = asyncio.create_task(adapter._listen_for_events())
+        try:
+            for _ in range(250):
+                await asyncio.sleep(0.02)
+                if adapter.handle_message.call_count:
+                    break
+        finally:
+            adapter._listening = False
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await loop_task
+
+        assert adapter.handle_message.call_args is not None
+        assert adapter.handle_message.call_args[0][0].source.thread_id == conv
+        # The registry: the rename repointed; nothing was forked.
+        assert adapter._conversations.current_name(7, conv) == "Release XY"
+        # And the reply routes to the renamed topic.
+        await adapter.send("7", "reply", metadata={"thread_id": conv})
+        sent = adapter.client._client._sent_messages[-1]
+        assert sent["topic"] == "Release XY"
