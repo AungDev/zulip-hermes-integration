@@ -128,8 +128,17 @@ class TestRegistryStore:
         assert registry.repoint(7, "deploys", "deploys-2") == conv
         assert registry.current_name(7, conv) == "deploys-2"
         assert registry.current_name(7, "deploys") is None
-        # The old name is tombstoned, not deleted.
-        assert registry.latest_tombstone(7) == (conv, "deploys")
+        # The conversation belongs to the beneficiary now; its old-name
+        # record is a NULL-membership audit row — a recreated "deploys"
+        # cannot adopt it (inheritance model).
+        row = registry._conn.execute(
+            "SELECT topic_name FROM tombstones"
+            " WHERE channel_id=7 AND conversation_id=?",
+            (conv,),
+        ).fetchone()
+        assert row is not None and row[0] is None
+        # Label reuse starts a fresh lineage (R4).
+        assert registry.resolve(7, "deploys") != conv
 
     def test_repoint_unmapped_name_is_noop(self, registry):
         assert registry.repoint(7, "ghost", "ghost-2") is None
@@ -139,11 +148,12 @@ class TestRegistryStore:
         conv_b = registry.resolve(7, "topic-b")
         # Rename topic-a onto topic-b's live name (R5).
         registry.repoint(7, "topic-a", "topic-b")
-        # topic-b now belongs to conv_a; conv_b is displaced (tombstoned).
+        # topic-b now belongs to conv_a; conv_b is displaced — into
+        # topic-b's OWN session set, so it can be /continue'd back.
         assert registry.current_name(7, conv_a) == "topic-b"
-        assert registry.latest_tombstone(7) in {(conv_b, "topic-b"), (conv_a, "topic-a")}
-        convs = {registry.current_name(7, conv_a), registry.current_name(7, conv_b)}
-        assert None in convs  # conv_b has no name anymore
+        assert registry.current_name(7, conv_b) is None
+        _cur, _org, members = registry.sessions_for_topic(7, "topic-b")
+        assert [m for m, _o in members] == [conv_b]
 
     def test_rebind_consumes_tombstone(self, registry):
         conv = registry.resolve(7, "old-name")
@@ -151,16 +161,24 @@ class TestRegistryStore:
         registry.resolve(7, "fresh-name")
         registry.rebind(7, "fresh-name", conv)
         assert registry.current_name(7, conv) == "fresh-name"
-        # The (fresh-name -> conv) tombstone is consumed; any tombstone left
-        # is the DISPLACED conversation's, not the re-bound pairing.
-        latest = registry.latest_tombstone(7)
-        assert latest is None or latest[0] != conv
+        # The re-bound conversation is live here; "fresh-name" keeps only
+        # the conversation it displaced as a former session.
+        _cur, _org, members = registry.sessions_for_topic(7, "fresh-name")
+        assert conv not in {m for m, _o in members}
 
-    def test_free_tombstones_without_mapping(self, registry):
+    def test_free_orphans_without_mapping(self, registry):
         conv = registry.resolve(7, "deploys")
         assert registry.free(7, "deploys") == conv
+        # No beneficiary (cross-channel move): mapping gone, session
+        # orphaned — unreachable by /continue from any topic.
         assert registry.current_name(7, conv) is None
-        assert registry.latest_tombstone(7) == (conv, "deploys")
+        assert registry.lookup(7, "deploys") is None
+        row = registry._conn.execute(
+            "SELECT topic_name FROM tombstones"
+            " WHERE channel_id=7 AND conversation_id=?",
+            (conv,),
+        ).fetchone()
+        assert row is None or row[0] is None  # never a live candidate
         assert registry.free(7, "deploys") is None  # idempotent
 
     def test_persists_across_instances(self, tmp_path):
@@ -176,16 +194,19 @@ class TestRegistryStore:
         assert reg_b.resolve(7, "deploys") != conv_a
 
 
-    def test_latest_tombstone_excludes_current_conversation(self, registry):
+    def test_continue_candidates_are_topic_scoped(self, registry):
         conv_a = registry.resolve(7, "TopicA")
         conv_b = registry.resolve(7, "TopicB")
-        registry.repoint(7, "TopicA", "TopicB")  # R5 collision: conv_a takes "TopicB"
-        # Freshest tombstone is the renaming conversation's old name (a
-        # no-op candidate for /continue in "TopicB"); excluding it surfaces
-        # the DISPLACED conversation instead.
-        latest = registry.latest_tombstone(7)
-        assert latest == (conv_a, "TopicA")
-        assert registry.latest_tombstone(7, exclude_conversation=conv_a) == (conv_b, "TopicB")
+        registry.repoint(7, "TopicA", "TopicB")  # R5: conv_a takes "TopicB"
+        # topic-b's own set: ONLY the displaced conv_b. The renaming
+        # conversation's old-name record is a NULL audit row — never a
+        # candidate (channel-wide selection is gone).
+        _cur, _org, members = registry.sessions_for_topic(7, "TopicB")
+        assert [m for m, _o in members] == [conv_b]
+        # An unrelated fresh topic has an empty set — nothing to steal.
+        registry.resolve(7, "TopicZ")
+        _cur_z, _org_z, members_z = registry.sessions_for_topic(7, "TopicZ")
+        assert members_z == []
 
 
     def test_multi_merge_chain_keeps_every_tombstone(self, registry):
@@ -196,14 +217,14 @@ class TestRegistryStore:
         conv_p = registry.resolve(7, "Deploy XY")
         registry.repoint(7, "Fix XY", "Discuss about XY")     # R5: conv_d displaced
         registry.repoint(7, "Deploy XY", "Discuss about XY")  # R5: conv_f displaced
-        # Per-conversation tombstone keying: each merge keeps its own row
-        # (per-name keying used to overwrite conv_d's tombstone here).
         assert registry.current_name(7, conv_p) == "Discuss about XY"
         assert registry.current_name(7, conv_d) is None
         assert registry.current_name(7, conv_f) is None
-        assert registry.latest_tombstone(7, exclude_conversation=conv_p) == (
-            conv_f, "Discuss about XY")
-        # All three conversations remain tracked (recoverable via /continue).
+        # The merged topic's own set: the two displaced sessions, most
+        # recent first. The winner's old-name record is a NULL audit row —
+        # invisible to every /continue (no beneficiary).
+        _cur, _org, members = registry.sessions_for_topic(7, "Discuss about XY")
+        assert [m for m, _o in members] == [conv_f, conv_d]
         rows = registry._conn.execute(
             "SELECT conversation_id FROM tombstones WHERE channel_id=7"
         ).fetchall()
@@ -382,31 +403,84 @@ class TestOutboundRouting:
 
 
 class TestContinueCommand:
-    """``/continue`` re-binds a topic to the renamed conversation (R7)."""
+    """``/continue <session-id>`` re-binds a topic to a session from its
+    OWN set (created there or inherited by full rename/merge). Bare
+    ``/continue`` does nothing; foreign and orphaned sessions are
+    unreachable."""
 
     @pytest.mark.asyncio
-    async def test_continue_rebinds_session(self, adapter):
+    async def test_continue_without_argument_does_nothing(self, adapter):
+        await adapter._handle_message(_stream_msg("deploys", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        await adapter._handle_message(
+            _stream_msg("deploys", msg_id=2, content="/continue")
+        )
+        cmd_call = adapter.client._client._sent_messages[0]
+        assert "Usage:" in cmd_call["content"]
+        assert "/continue <session-id>" in cmd_call["content"]
+        # Registry untouched: the topic still holds its own session.
+        assert adapter._conversations.lookup(7, "deploys") == conv
+
+    @pytest.mark.asyncio
+    async def test_recreated_name_cannot_adopt_renamed_away_session(self, adapter):
+        # Inheritance model: after old-name -> new-name, the session
+        # belongs to "new-name". A recreated "old-name" is a new lineage —
+        # its /continue must NOT reach the original session.
         await adapter._handle_message(_stream_msg("old-name", msg_id=1))
         original = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
         adapter._handle_topic_update(_rename_event("old-name", "new-name"))
-        # Someone creates a fresh "old-name" topic and asks to continue.
+        await adapter._handle_message(_stream_msg("old-name", msg_id=3))
+        fresh = adapter.handle_message.call_args[0][0].source.thread_id
+        assert fresh != original
+        adapter.handle_message.reset_mock()
         await adapter._handle_message(
-            _stream_msg("old-name", msg_id=3, content="/continue")
+            _stream_msg("old-name", msg_id=4, content=f"/continue {original}")
         )
         cmd_call = adapter.client._client._sent_messages[0]
-        assert "old-name" in cmd_call["content"]  # confirmation names it
-        # The NEXT message in that topic continues the original session.
-        await adapter._handle_message(_stream_msg("old-name", msg_id=4))
-        rebound = adapter.handle_message.call_args[0][0].source.thread_id
-        assert rebound == original
+        assert "not part of this topic's session set" in cmd_call["content"]
+        # And the session is still held by "new-name".
+        assert adapter._conversations.lookup(7, "new-name") == original
 
     @pytest.mark.asyncio
-    async def test_continue_without_tombstone_replies_gracefully(self, adapter):
+    async def test_continue_foreign_session_rejected(self, adapter):
+        await adapter._handle_message(_stream_msg("deploys", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        # A session held by ANOTHER topic is not continuable here.
+        await adapter._handle_message(_stream_msg("other", msg_id=2))
+        other = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
         await adapter._handle_message(
-            _stream_msg("never-renamed", msg_id=1, content="/continue")
+            _stream_msg("deploys", msg_id=3, content=f"/continue {other}")
         )
         cmd_call = adapter.client._client._sent_messages[0]
-        assert "No recently renamed conversation" in cmd_call["content"]
+        assert "not part of this topic's session set" in cmd_call["content"]
+        # Nothing changed.
+        assert adapter._conversations.lookup(7, "deploys") == conv
+
+    @pytest.mark.asyncio
+    async def test_continue_malformed_id_rejected(self, adapter):
+        await adapter._handle_message(_stream_msg("deploys", msg_id=1))
+        adapter.handle_message.reset_mock()
+        await adapter._handle_message(
+            _stream_msg("deploys", msg_id=2, content="/continue not-an-id")
+        )
+        cmd_call = adapter.client._client._sent_messages[0]
+        assert "not a session id" in cmd_call["content"]
+        assert adapter._conversations.lookup(7, "deploys") is not None
+
+    @pytest.mark.asyncio
+    async def test_continue_current_session_is_noop(self, adapter):
+        await adapter._handle_message(_stream_msg("deploys", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        await adapter._handle_message(
+            _stream_msg("deploys", msg_id=2, content=f"/continue {conv}")
+        )
+        cmd_call = adapter.client._client._sent_messages[0]
+        assert "already the current one" in cmd_call["content"]
 
     @pytest.mark.asyncio
     async def test_continue_repairs_displaced_conversation_after_collision(self, adapter):
@@ -416,19 +490,18 @@ class TestContinueCommand:
         conv_b = adapter.handle_message.call_args[0][0].source.thread_id
         # R5 collision: rename TopicA onto the live TopicB name.
         adapter._handle_topic_update(_rename_event("TopicA", "TopicB"))
-        # /continue in TopicB must reach the DISPLACED conversation (conv_b),
-        # not the renaming conversation's old-name tombstone (a no-op).
+        # /continue <conv_b> in TopicB restores TopicB's own session.
         await adapter._handle_message(
-            _stream_msg("TopicB", msg_id=3, content="/continue")
+            _stream_msg("TopicB", msg_id=3, content=f"/continue {conv_b}")
         )
         cmd_call = adapter.client._client._sent_messages[0]
-        assert "TopicB" in cmd_call["content"]  # confirmation names the tombstone
+        assert conv_b in cmd_call["content"]
         await adapter._handle_message(_stream_msg("TopicB", msg_id=4))
         rebound = adapter.handle_message.call_args[0][0].source.thread_id
         assert rebound == conv_b  # TopicB's old session restored
-        # /continue toggles back to the renaming conversation (2-way cycle).
+        # Toggle back to the renaming conversation by its id.
         await adapter._handle_message(
-            _stream_msg("TopicB", msg_id=5, content="/continue")
+            _stream_msg("TopicB", msg_id=5, content=f"/continue {conv_a}")
         )
         await adapter._handle_message(_stream_msg("TopicB", msg_id=6))
         toggled = adapter.handle_message.call_args[0][0].source.thread_id
@@ -436,22 +509,39 @@ class TestContinueCommand:
 
     @pytest.mark.asyncio
     async def test_multi_merge_then_continue_reaches_recent_conversations(self, adapter):
+        convs = {}
         for i, name in enumerate(
             ["Discuss about XY", "Fix XY", "Deploy XY"], start=1
         ):
             await adapter._handle_message(_stream_msg(name, msg_id=i))
-        conv_p = adapter.handle_message.call_args[0][0].source.thread_id
+            convs[name] = adapter.handle_message.call_args[0][0].source.thread_id
+        conv_d, conv_f, conv_p = (
+            convs[n] for n in ["Discuss about XY", "Fix XY", "Deploy XY"]
+        )
         adapter._handle_topic_update(_rename_event("Fix XY", "Discuss about XY"))
         adapter._handle_topic_update(_rename_event("Deploy XY", "Discuss about XY"))
         # Last renamer wins the name: the live session is Deploy XY's.
         await adapter._handle_message(_stream_msg("Discuss about XY", msg_id=9))
         assert adapter.handle_message.call_args[0][0].source.thread_id == conv_p
-        # /continue reaches the most recent OTHER conversation (Fix XY's).
+        # /continue <id> cycles through the topic's own set: the inherited
+        # Fix XY session...
         await adapter._handle_message(
-            _stream_msg("Discuss about XY", msg_id=10, content="/continue")
+            _stream_msg("Discuss about XY", msg_id=10, content=f"/continue {conv_f}")
         )
         await adapter._handle_message(_stream_msg("Discuss about XY", msg_id=11))
-        assert adapter.handle_message.call_args[0][0].source.thread_id != conv_p
+        assert adapter.handle_message.call_args[0][0].source.thread_id == conv_f
+        # ...the original Discuss about XY session...
+        await adapter._handle_message(
+            _stream_msg("Discuss about XY", msg_id=12, content=f"/continue {conv_d}")
+        )
+        await adapter._handle_message(_stream_msg("Discuss about XY", msg_id=13))
+        assert adapter.handle_message.call_args[0][0].source.thread_id == conv_d
+        # ...and back to the Deploy XY session.
+        await adapter._handle_message(
+            _stream_msg("Discuss about XY", msg_id=14, content=f"/continue {conv_p}")
+        )
+        await adapter._handle_message(_stream_msg("Discuss about XY", msg_id=15))
+        assert adapter.handle_message.call_args[0][0].source.thread_id == conv_p
 
     @pytest.mark.asyncio
     async def test_sessions_lists_topic_sessions(self, adapter):
@@ -697,3 +787,127 @@ class TestF1DispatchOrderResolve:
         await adapter.send("7", "reply", metadata={"thread_id": conv})
         sent = adapter.client._client._sent_messages[-1]
         assert sent["topic"] == "Release XY"
+
+
+class TestTopicDeletionOrphaning:
+    """R10: a topic deleted WITHOUT rename/merge has no beneficiary — its
+    whole session set is orphaned (unreachable by /continue from any
+    topic) and a recreated same-name topic starts a fresh lineage.
+
+    The delete_message event is only a TRIGGER; the channel's topic list
+    (get_stream_topics) is the authority, so a partial bulk delete (2 of
+    9 messages) never orphans a living topic."""
+
+    @staticmethod
+    def _delete_event(topic, message_ids, event_id=50):
+        return {
+            "id": event_id,
+            "type": "delete_message",
+            "message_type": "stream",
+            "stream_id": 7,
+            "topic": topic,
+            "message_ids": message_ids,
+        }
+
+    @pytest.mark.asyncio
+    async def test_full_deletion_orphans_and_recreate_starts_fresh(self, adapter):
+        await adapter._handle_message(_stream_msg("Discuss XY", msg_id=1))
+        conv_d = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        adapter._handle_topic_update(_rename_event("Discuss XY", "Release XY"))
+        # Recreate "Discuss XY": fresh lineage, with an inherited former
+        # session so the orphaning has something to detach.
+        await adapter._handle_message(_stream_msg("Discuss XY", msg_id=3))
+        fresh = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        await adapter._handle_message(_stream_msg("Other", msg_id=4))
+        conv_o = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        adapter._handle_topic_update(_rename_event("Other", "Discuss XY"))
+        # "Discuss XY" now holds conv_o (current) + fresh (former member).
+        _cur, _org, members = adapter._conversations.sessions_for_topic(7, "Discuss XY")
+        assert [m for m, _o in members] == [fresh]
+
+        # The whole topic is deleted: absent from the channel's topic list.
+        adapter.client._client.stream_topics[7] = ["Release XY"]
+        adapter._handle_message_delete_event(
+            self._delete_event("Discuss XY", [3, 4, 5])
+        )
+        await adapter._apply_topic_deletion(7, "Discuss XY")
+
+        # No beneficiary: mapping gone, set unreachable.
+        assert adapter._conversations.lookup(7, "Discuss XY") is None
+        _cur, _org, members = adapter._conversations.sessions_for_topic(7, "Discuss XY")
+        assert members == []
+        assert adapter._conversations.current_name(7, conv_o) is None
+        assert adapter._conversations.current_name(7, fresh) is None
+
+        # A recreated "Discuss XY" starts FRESH and cannot adopt anything.
+        await adapter._handle_message(_stream_msg("Discuss XY", msg_id=6))
+        recreated = adapter.handle_message.call_args[0][0].source.thread_id
+        assert recreated not in {conv_o, fresh}
+        adapter.handle_message.reset_mock()
+        await adapter._handle_message(
+            _stream_msg("Discuss XY", msg_id=7, content=f"/continue {conv_o}")
+        )
+        cmd_call = adapter.client._client._sent_messages[0]
+        assert "not part of this topic's session set" in cmd_call["content"]
+
+    @pytest.mark.asyncio
+    async def test_partial_bulk_delete_keeps_living_topic(self, adapter):
+        # Deleting 2 of 9 messages is a bulk event but NOT a topic deletion.
+        await adapter._handle_message(_stream_msg("deploys", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        adapter.client._client.stream_topics[7] = ["deploys"]  # topic still exists
+        adapter._handle_message_delete_event(self._delete_event("deploys", [1, 2]))
+        await adapter._apply_topic_deletion(7, "deploys")
+        # Mapping and sessions intact.
+        assert adapter._conversations.lookup(7, "deploys") == conv
+
+    @pytest.mark.asyncio
+    async def test_single_non_anchor_delete_never_verifies(self, adapter, monkeypatch):
+        await adapter._handle_message(_stream_msg("deploys", msg_id=1))
+        adapter.handle_message.reset_mock()
+        probe = AsyncMock()
+        monkeypatch.setattr(adapter, "_apply_topic_deletion", probe)
+        adapter._handle_message_delete_event(self._delete_event("deploys", [999]))
+        probe.assert_not_called()  # no verification, nothing touched
+
+    @pytest.mark.asyncio
+    async def test_anchor_single_delete_verifies_and_orphans(self, adapter):
+        # A one-message topic whose only (anchor) message is deleted.
+        queued = _stream_msg("solo", msg_id=41)
+        adapter._pre_resolve_conversation(queued, "41")
+        conv = adapter._conversations.lookup(7, "solo")
+        assert conv is not None
+        assert adapter._conversations.anchor_of(7, "solo") == 41
+        adapter.client._client.stream_topics[7] = ["other-topic"]  # "solo" gone
+        adapter._handle_message_delete_event(self._delete_event("solo", [41]))
+        await adapter._apply_topic_deletion(7, "solo")
+        assert adapter._conversations.lookup(7, "solo") is None
+        assert adapter._conversations.current_name(7, conv) is None
+
+    @pytest.mark.asyncio
+    async def test_verification_failure_keeps_mapping(self, adapter, monkeypatch):
+        await adapter._handle_message(_stream_msg("deploys", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+
+        def _boom(stream_id):
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr(adapter.client._client, "get_stream_topics", _boom)
+        adapter._handle_message_delete_event(self._delete_event("deploys", [1, 2]))
+        # The handler swallows the verification error (fail-open, logged).
+        await adapter._apply_topic_deletion(7, "deploys")
+        # Fail-open: the mapping is kept.
+        assert adapter._conversations.lookup(7, "deploys") == conv
+
+    @pytest.mark.asyncio
+    async def test_unmapped_topic_delete_event_ignored(self, adapter):
+        adapter._handle_message_delete_event(
+            self._delete_event("ghost", [1, 2, 3])
+        )
+        # Nothing mapped: no verification task, no state change anywhere.
+        assert adapter._conversations.lookup(7, "ghost") is None

@@ -616,7 +616,8 @@ class ZulipAdapter(BasePlatformAdapter):
             account_id=self.email or "default",
             data_dir=self._data_dir,
             register_fn=lambda: self.client.register(
-                event_types=["message", "update_message"], fetch_event_id=0
+                event_types=["message", "update_message", "delete_message"],
+                fetch_event_id=0,
             ),
         )
         self._dedupe = ZulipDedupeStore(
@@ -1021,6 +1022,11 @@ class ZulipAdapter(BasePlatformAdapter):
                         # Topic renames/moves: registry maintenance for stable
                         # topic sessions. Fast + ordered, handled inline.
                         self._handle_topic_update(event)
+                    elif event.get("type") == "delete_message":
+                        # Topic deletion (R10): the event is only a trigger;
+                        # verified against the channel's topic list before
+                        # anything is freed. Async (one API call), rare.
+                        self._handle_message_delete_event(event)
 
                 # Fire-and-forget: don't await processing tasks here so the
                 # poll loop keeps fetching events. Errors are logged inside
@@ -1274,29 +1280,144 @@ class ZulipAdapter(BasePlatformAdapter):
         )
         return "\n".join(lines)
 
-    def _continue_command_reply(self, stream_id: int, topic: str) -> str:
-        """``/continue``: re-bind this topic to the most recently renamed
-        conversation in the channel (R7). Consumes the tombstone."""
+    def _continue_command_reply(
+        self, stream_id: int, topic: str, arg: str = ""
+    ) -> str:
+        """``/continue <session-id>`` (R7, inheritance-scoped).
+
+        Re-binds this topic to a session from ITS OWN session set — the
+        sessions it created plus those handed to it by full renames
+        (merges) — as listed by ``/topic-sessions``. Bare ``/continue``
+        does nothing: there is no implicit pick, and a session held by
+        another topic (or orphaned) can never be named here, because it
+        is not part of this topic's set.
+        """
         if self._conversations is None:
             return (
                 "Topic sessions are disabled"
                 " (set ZULIP_TOPIC_SESSIONS=true to enable them)."
             )
+        arg = (arg or "").strip()
+        if not arg:
+            return (
+                "Usage: `/continue <session-id>` — re-bind this topic to one"
+                " of its own former sessions (ids via `/topic-sessions`)."
+                " `/continue` alone does nothing."
+            )
+        conversation_id = arg.split()[0]
+        if not _CONVERSATION_ID_RE.fullmatch(conversation_id):
+            return (
+                "That is not a session id (expected `c` + 12 hex characters,"
+                " as shown by `/topic-sessions`). Nothing was changed."
+            )
         current = self._conversations.lookup(stream_id, topic)
-        entry = self._conversations.latest_tombstone(
-            stream_id, exclude_conversation=current
-        )
-        if entry is None:
-            return "No recently renamed conversation found in this channel."
-        conversation_id, old_name = entry
+        if current is None:
+            return "This topic has no session yet — nothing to continue."
+        if conversation_id == current:
+            return "That session is already the current one here."
+        member_ids = {
+            member_id
+            for member_id, _origin in self._conversations.sessions_for_topic(
+                stream_id, topic
+            )[2]
+        }
+        if conversation_id not in member_ids:
+            return (
+                "That session is not part of this topic's session set"
+                " (own + inherited) — a session held by another topic or"
+                " orphaned cannot be continued. Nothing was changed."
+                " See `/topic-sessions`."
+            )
+        previous = current
         self._conversations.rebind(stream_id, topic, conversation_id)
+        origin = self._conversations.sessions_for_topic(stream_id, topic)[1]
         logger.debug(
             "zulip conversation rebound via /continue [channel=%s conv=%s topic=%r]",
             stream_id, conversation_id, mask_pii(topic),
         )
         return (
-            f"🔗 This topic is now bound to the conversation previously at"
-            f" **{old_name}** — the session continues here."
+            f"🔗 This topic now continues session `{conversation_id}`"
+            f" (started in **{origin}**). The previous session stays here"
+            f" as a former session — `/continue {previous}` switches back."
+        )
+
+    async def _handle_message_delete_event(self, event: dict) -> None:
+        """R10 trigger: a ``delete_message`` event that *may* mean a topic
+        was deleted.
+
+        The event alone cannot distinguish "some messages deleted" from
+        "the topic deleted" (partial bulk deletes exist — deleting 2 of 9
+        messages is bulk but not a topic deletion), so the event only
+        triggers a verification; the channel's topic list
+        (``get_stream_topics``) is the authority: a topic exists while it
+        has messages. Fail-open: on any verification problem the mapping
+        stays.
+        """
+        if self._conversations is None:
+            return
+        if event.get("message_type") != "stream":
+            return
+        stream_id = event.get("stream_id")
+        topic = event.get("topic", "")
+        if not isinstance(stream_id, int) or not topic:
+            return
+        if self._conversations.lookup(stream_id, topic) is None:
+            return
+        message_ids = event.get("message_ids") or []
+        bulk = len(message_ids) > 1
+        anchor = self._conversations.anchor_of(stream_id, topic)
+        anchor_hit = bool(
+            not bulk
+            and anchor is not None
+            and any(
+                str(mid) == str(anchor)
+                for mid in message_ids
+                if str(mid).lstrip("-").isdigit()
+            )
+        )
+        if not bulk and not anchor_hit:
+            return
+        asyncio.create_task(self._apply_topic_deletion(stream_id, topic))
+
+    async def _apply_topic_deletion(self, stream_id: int, topic: str) -> None:
+        """Verify a deletion trigger against the channel's topic list and,
+        only if the topic is really gone, orphan its session set (R10)."""
+        try:
+            result = await self._sdk_call(
+                self.client.get_stream_topics, stream_id, timeout=10.0
+            )
+        except Exception:
+            logger.exception(
+                "zulip topic-deletion verification failed; mapping kept"
+                " [channel=%s topic=%r]",
+                stream_id,
+                mask_pii(topic),
+            )
+            return
+        if not isinstance(result, dict) or result.get("result") != "success":
+            logger.warning(
+                "zulip topic-deletion verification unavailable; mapping kept"
+                " [channel=%s topic=%r]",
+                stream_id,
+                mask_pii(topic),
+            )
+            return
+        names = {str(t.get("name", "")) for t in (result.get("topics") or [])}
+        if topic in names:
+            logger.info(
+                "zulip delete event verified: topic still exists — ignored"
+                " [channel=%s topic=%r]",
+                stream_id,
+                mask_pii(topic),
+            )
+            return
+        orphaned = self._conversations.orphan_topic_sessions(stream_id, topic)
+        logger.info(
+            "zulip topic deleted — session set orphaned (no beneficiary)"
+            " [channel=%s topic=%r former=%d]",
+            stream_id,
+            mask_pii(topic),
+            orphaned,
         )
 
     async def _handle_message(self, message: dict):
@@ -1499,11 +1620,13 @@ class ZulipAdapter(BasePlatformAdapter):
                 if self._conversations is not None and msg_type == "stream"
                 else ""
             )
-            if topic_cmd == "/continue":
+            if topic_cmd == "/continue" or topic_cmd.startswith("/continue "):
                 cmd_result = CommandResult(
                     handled=True,
                     reply=self._continue_command_reply(
-                        int(message.get("stream_id") or 0), cmd_topic or ""
+                        int(message.get("stream_id") or 0),
+                        cmd_topic or "",
+                        topic_cmd[len("/continue"):].strip(),
                     ),
                 )
             elif topic_cmd == "/topic-sessions":

@@ -28,6 +28,10 @@ class MockZulipClient:
         self._sent_messages = []
         self._reactions = []
         self._uploads = []
+        # stream_id -> [topic names] for get_stream_topics (R10 deletion
+        # verification). UNCONFIGURED streams return an error result — the
+        # adapter's fail-open path keeps the mapping (safe default).
+        self.stream_topics = {}
 
     def get_server_settings(self):
         return self._server_settings
@@ -82,6 +86,12 @@ class MockZulipClient:
         uri = f"/user_uploads/{len(self._uploads)}"
         self._uploads.append({"uri": uri, "file": file})
         return {"result": "success", "uri": uri}
+
+    def get_stream_topics(self, stream_id):
+        names = self.stream_topics.get(stream_id)
+        if names is None:
+            return {"result": "error", "msg": "stream topics not configured"}
+        return {"result": "success", "topics": [{"name": n} for n in names]}
 
     def inject_event(self, event):
         """Helper: queue an event for get_events to return."""

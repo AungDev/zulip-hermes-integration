@@ -65,17 +65,19 @@ class TopicConversationRegistry:
 
     def _init_schema(self) -> None:
         with self._lock, self._conn:
-            # Schema v3: adds origin_name to both tables — the topic where
-            # a conversation was BORN (set at mint, never renamed). It
-            # labels sessions in the /topic-sessions listing ("started in X")
-            # while topic_name tracks current membership (carried along
-            # on renames). v2 added the per-conversation tombstone key
-            # and the topic/session unique index.
+            # Schema v4: tombstone membership (topic_name) becomes nullable.
+            # NULL = ORPHANED — the session set has no beneficiary (topic
+            # deleted without rename, cross-channel move) and is unreachable
+            # by /continue from any topic, per the inheritance model: a
+            # topic only owns sessions it created or received via full
+            # rename (merge). v3 added origin_name to both tables; v2 the
+            # per-conversation tombstone key and the topic/session unique
+            # index.
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-            if version < 3:
+            if version < 4:
                 self._conn.execute("DROP TABLE IF EXISTS topic_map")
                 self._conn.execute("DROP TABLE IF EXISTS tombstones")
-                self._conn.execute("PRAGMA user_version = 3")
+                self._conn.execute("PRAGMA user_version = 4")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS topic_map (
@@ -102,7 +104,7 @@ class TopicConversationRegistry:
                   account_id      TEXT NOT NULL,
                   channel_id      INTEGER NOT NULL,
                   conversation_id TEXT NOT NULL,
-                  topic_name      TEXT NOT NULL,
+                  topic_name      TEXT,
                   origin_name     TEXT NOT NULL,
                   freed_at        REAL NOT NULL,
                   PRIMARY KEY (account_id, channel_id, conversation_id)
@@ -134,9 +136,12 @@ class TopicConversationRegistry:
                 return str(row[0])
 
             conversation_id = _new_conversation_id()
-            # NOTE: no tombstone purge here. A reused label keeps the old
-            # conversation's tombstone so /continue (R7) can still re-bind
-            # the reused name to it — an explicit human repair after R4.
+            # NOTE: no tombstone purge here — none is needed. Tombstone
+            # membership follows the beneficiary of a rename (or is NULL
+            # for orphaned sessions), never the freed name, so a reused
+            # label cannot accidentally adopt a previous lineage: under
+            # the inheritance model the reused name simply starts a fresh
+            # conversation (R4).
             self._conn.execute(
                 "INSERT INTO topic_map"
                 " (account_id, channel_id, topic_name, conversation_id,"
@@ -219,7 +224,11 @@ class TopicConversationRegistry:
                     ),
                 )
 
-            # Free the old name, then map the new name.
+            # Free the old name. The conversation itself now belongs to the
+            # beneficiary (the new name, by full-rename inheritance), so its
+            # old-name record is kept as a NULL-membership audit row: it
+            # must never become a /continue candidate for a recreated
+            # old-name topic (a held session cannot be taken).
             self._conn.execute(
                 "DELETE FROM topic_map"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
@@ -228,8 +237,8 @@ class TopicConversationRegistry:
             self._conn.execute(
                 "INSERT OR REPLACE INTO tombstones"
                 " (account_id, channel_id, topic_name, conversation_id,"
-                "  origin_name, freed_at) VALUES (?,?,?,?,?,?)",
-                (self.account_id, channel_id, old_name, conversation_id, origin_name, now),
+                "  origin_name, freed_at) VALUES (?,?,NULL,?,?,?)",
+                (self.account_id, channel_id, conversation_id, origin_name, now),
             )
             # Map the new name to the same conversation, preserving the
             # conversation's anchor message id and origin.
@@ -280,37 +289,6 @@ class TopicConversationRegistry:
                 (self.account_id, channel_id, topic_name),
             ).fetchone()
             return str(row[0]) if row is not None else None
-
-    def latest_tombstone(
-        self, channel_id: int, exclude_conversation: Optional[str] = None
-    ) -> Optional[Tuple[str, str]]:
-        """Most recently freed conversation in a channel: (id, old_name).
-
-        ``exclude_conversation`` skips tombstones of a conversation the
-        caller is already bound to. Needed for the R5 displacement case:
-        the freshest tombstone there belongs to the *renaming* conversation
-        (its freed old name) — a no-op candidate for ``/continue`` — while
-        the displaced conversation sits right behind it.
-        """
-        with self._lock:
-            # rowid DESC breaks same-tick freed_at ties deterministically
-            # (later writes — e.g. the orig-name tombstone after a
-            # displacement — sort first).
-            if exclude_conversation is not None:
-                row = self._conn.execute(
-                    "SELECT conversation_id, topic_name FROM tombstones"
-                    " WHERE account_id=? AND channel_id=? AND conversation_id != ?"
-                    " ORDER BY freed_at DESC, rowid DESC LIMIT 1",
-                    (self.account_id, channel_id, exclude_conversation),
-                ).fetchone()
-            else:
-                row = self._conn.execute(
-                    "SELECT conversation_id, topic_name FROM tombstones"
-                    " WHERE account_id=? AND channel_id=?"
-                    " ORDER BY freed_at DESC, rowid DESC LIMIT 1",
-                    (self.account_id, channel_id),
-                ).fetchone()
-            return (str(row[0]), str(row[1])) if row is not None else None
 
     def rebind(self, channel_id: int, topic_name: str, conversation_id: str) -> None:
         """Manual re-bind (R7, ``/continue``): map a topic to a conversation.
@@ -454,10 +432,55 @@ class TopicConversationRegistry:
                 members,
             )
 
+    # -- R10 (deletion / orphaning) -----------------------------------------
+
+    def orphan_topic_sessions(self, channel_id: int, topic_name: str) -> int:
+        """Topic deleted without rename/merge (R10): no beneficiary.
+
+        Removes the live mapping WITHOUT a successor tombstone and marks
+        every former-session tombstone of this topic orphaned
+        (``topic_name = NULL``). Orphaned sessions are unreachable by
+        ``/continue`` from any topic — including a recreated same-name
+        topic, which starts a fresh lineage (R4). Rows are kept, never
+        deleted. Returns the number of orphaned tombstone rows.
+        """
+
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM topic_map"
+                " WHERE account_id=? AND channel_id=? AND topic_name=?",
+                (self.account_id, channel_id, topic_name),
+            )
+            cur = self._conn.execute(
+                "UPDATE tombstones SET topic_name=NULL"
+                " WHERE account_id=? AND channel_id=? AND topic_name=?",
+                (self.account_id, channel_id, topic_name),
+            )
+            return int(cur.rowcount or 0)
+
+    def anchor_of(self, channel_id: int, topic_name: str) -> Optional[int]:
+        """The topic's stored anchor message id (deletion-detection trigger)."""
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT anchor_message_id FROM topic_map"
+                " WHERE account_id=? AND channel_id=? AND topic_name=?",
+                (self.account_id, channel_id, topic_name),
+            ).fetchone()
+            return int(row[0]) if row is not None and row[0] is not None else None
+
     # -- R8 ----------------------------------------------------------------
 
     def free(self, channel_id: int, topic_name: str) -> Optional[str]:
-        """Remove a mapping, tombstoning it (cross-channel move, R8)."""
+        """Remove a mapping (cross-channel move, R8).
+
+        The moved topic's session set has no beneficiary — the destination
+        is a different topic (same name in another channel) and sessions
+        never cross channels — so the conversation is ORPHANED rather than
+        tombstoned into any topic's former set: unreachable by /continue,
+        retained as audit rows. Returns the conversation id, or None when
+        nothing was mapped.
+        """
 
         with self._lock, self._conn:
             row = self._conn.execute(
@@ -468,28 +491,15 @@ class TopicConversationRegistry:
             if row is None:
                 return None
             conversation_id = str(row[0])
-            origin_row = self._conn.execute(
-                "SELECT origin_name FROM topic_map"
-                " WHERE account_id=? AND channel_id=? AND topic_name=?",
-                (self.account_id, channel_id, topic_name),
-            ).fetchone()
-            origin_name = str(origin_row[0]) if origin_row is not None else topic_name
             self._conn.execute(
                 "DELETE FROM topic_map"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             )
+            # Orphan the conversation's tombstone rows (no beneficiary).
             self._conn.execute(
-                "INSERT OR REPLACE INTO tombstones"
-                " (account_id, channel_id, topic_name, conversation_id,"
-                "  origin_name, freed_at) VALUES (?,?,?,?,?,?)",
-                (
-                    self.account_id,
-                    channel_id,
-                    topic_name,
-                    conversation_id,
-                    origin_name,
-                    time.time(),
-                ),
+                "UPDATE tombstones SET topic_name=NULL"
+                " WHERE account_id=? AND channel_id=? AND conversation_id=?",
+                (self.account_id, channel_id, conversation_id),
             )
             return conversation_id
