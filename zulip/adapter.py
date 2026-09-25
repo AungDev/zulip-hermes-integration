@@ -9,8 +9,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import time
+from dataclasses import replace as _dc_replace
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, Any, overload
@@ -471,6 +473,19 @@ def _metadata_topic(metadata: Any) -> Optional[str]:
         if text:
             return text
     return None
+
+
+# Legacy (pre-stable-sessions) zulip stream session key:
+#   agent:<profile>:zulip:stream:<channel_id>:<topic_name>
+# The topic is everything after the channel prefix — topic names may
+# contain colons, so the tail is captured greedily.
+_LEGACY_ZULIP_STREAM_KEY = re.compile(
+    r"^(?P<prefix>agent:[^:]+:zulip:stream:(?P<channel>\d+):)(?P<topic>.+)$"
+)
+
+# Conversation ids minted by the registry ("c" + 12 hex chars) — used to
+# recognize already-migrated (conv-keyed) session keys.
+_CONVERSATION_ID_RE = re.compile(r"^c[0-9a-f]{12}$")
 
 
 def _topic_sessions_enabled() -> bool:
@@ -1088,6 +1103,84 @@ class ZulipAdapter(BasePlatformAdapter):
         if not chat_id.isdigit():
             return _metadata_topic(metadata)
         return self._routed_topic(int(chat_id), metadata)
+
+    # -- upgrade migration --------------------------------------------------
+
+    def set_session_store(self, session_store: Any) -> None:
+        super().set_session_store(session_store)
+        if self._conversations is not None:
+            try:
+                self._migrate_legacy_topic_sessions()
+            except Exception:
+                # Fail open: a failed migration must not block adapter
+                # startup; affected topics simply start fresh sessions.
+                logger.exception(
+                    "zulip legacy-session migration failed; continuing with fresh keys"
+                )
+
+    def _migrate_legacy_topic_sessions(self) -> int:
+        """One-time continuity migration (upgrade or first enable).
+
+        Re-keys existing name-keyed zulip stream sessions to the stable
+        conversation-id keys, so users keep their current sessions when
+        the feature turns on instead of starting fresh per topic:
+
+            agent:<ns>:zulip:stream:<ch>:<topic>  ->  ...:<ch>:<conv_id>
+
+        The registry is seeded with the (topic -> conversation) mapping in
+        the same pass; transcripts are untouched (the session id does not
+        change, only its routing key). Idempotent: conv-keyed entries are
+        recognized and skipped; a name-keyed route whose conv-keyed
+        successor already exists (previous enable cycle) is dropped as
+        stale. Runs before the first message flows (the gateway wires
+        ``set_session_store`` during adapter setup).
+
+        Uses the store's routing internals (``_entries``/``_save`` under
+        ``_lock``) the same way the store's own ``rekey_profile_routing``
+        does — no per-key public rekey API exists on the store yet;
+        revisit on gateway upgrades.
+        """
+        if self._conversations is None:
+            return 0
+        store = getattr(self, "_session_store", None)
+        entries = getattr(store, "_entries", None)
+        lock = getattr(store, "_lock", None)
+        save = getattr(store, "_save", None)
+        if entries is None or lock is None or save is None:
+            logger.debug(
+                "zulip legacy-session migration skipped: no compatible session store"
+            )
+            return 0
+        with lock:
+            moves = []
+            for key, entry in list(entries.items()):
+                m = _LEGACY_ZULIP_STREAM_KEY.match(key)
+                if m is None or _CONVERSATION_ID_RE.fullmatch(m["topic"]):
+                    continue
+                conversation_id = self._conversations.resolve(
+                    int(m["channel"]), m["topic"]
+                )
+                new_key = f"{m['prefix']}{conversation_id}"
+                if new_key in entries:
+                    # The conv-keyed session is the successor; the name-keyed
+                    # route is stale residue from a previous enable cycle.
+                    entries.pop(key, None)
+                    logger.info(
+                        "zulip legacy migration dropped stale route [key=%s]",
+                        mask_pii(key),
+                    )
+                    continue
+                moves.append((key, new_key, entry))
+            for old_key, new_key, entry in moves:
+                entries.pop(old_key, None)
+                entries[new_key] = _dc_replace(entry, session_key=new_key)
+            if moves:
+                save()
+        if moves:
+            logger.info(
+                "zulip legacy-session migration: rekeyed %d session(s)", len(moves)
+            )
+        return len(moves)
 
     def _topic_sessions_command_reply(self, stream_id: int, topic: str) -> str:
         """``/topic-sessions`` (topic sessions): list this topic's session set.

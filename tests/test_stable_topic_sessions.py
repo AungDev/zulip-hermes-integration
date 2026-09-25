@@ -15,6 +15,8 @@ Implements the routing rules R1-R8 from the project DESIGN.md:
 """
 
 import shutil
+import threading
+from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -516,4 +518,92 @@ class TestContinueCommand:
         sent = adapter.client._client._sent_messages
         assert not any("Sessions for this topic" in str(m) for m in sent)
         assert core.call_args[1]["content"] == "/sessions"
+
+@dataclass
+class _FakeRouteEntry:
+    """Minimal stand-in for the store's SessionEntry (a dataclass)."""
+    session_key: str
+    session_id: str
+
+
+class _FakeSessionStore:
+    """Minimal SessionStore surface the migration relies on:
+    ``_entries`` dict, ``_lock``, ``_save()`` (same shape the store's own
+    ``rekey_profile_routing`` uses)."""
+
+    def __init__(self, entries=None):
+        self._entries = dict(entries or {})
+        self._lock = threading.Lock()
+        self.save_calls = 0
+
+    def _save(self):
+        self.save_calls += 1
+
+
+class TestLegacySessionMigration:
+    """Upgrade/first-enable migration: name-keyed sessions keep their
+    sessions by being re-keyed onto conversation ids (no continuity loss)."""
+
+    def test_rekeys_name_keyed_sessions_and_seeds_registry(self, adapter):
+        old_key = "agent:main:zulip:stream:7:Discuss about XY"
+        dm_key = "agent:main:zulip:dm:5:someone"
+        conv_key = "agent:main:zulip:stream:9:cabcdef123456"
+        store = _FakeSessionStore({
+            old_key: _FakeRouteEntry(old_key, "s-old"),
+            dm_key: _FakeRouteEntry(dm_key, "s-dm"),
+            conv_key: _FakeRouteEntry(conv_key, "s-conv"),
+        })
+        adapter.set_session_store(store)  # gateway wiring hook triggers migration
+        conv = adapter._conversations.lookup(7, "Discuss about XY")
+        assert conv is not None
+        new_key = f"agent:main:zulip:stream:7:{conv}"
+        # The session MOVED — same session_id, new routing key.
+        assert old_key not in store._entries
+        assert store._entries[new_key].session_id == "s-old"
+        assert store._entries[new_key].session_key == new_key
+        # Non-matching keys untouched.
+        assert dm_key in store._entries
+        assert conv_key in store._entries
+        assert store.save_calls == 1
+        # Continuity: inbound resolution now lands on the same key.
+        assert adapter._conversations.resolve(7, "Discuss about XY") == conv
+
+    def test_migration_is_idempotent(self, adapter):
+        store = _FakeSessionStore({
+            "agent:main:zulip:stream:7:TopicA": _FakeRouteEntry(
+                "agent:main:zulip:stream:7:TopicA", "s1"),
+        })
+        adapter.set_session_store(store)
+        assert adapter._migrate_legacy_topic_sessions() == 0
+        assert store.save_calls == 1  # no second save
+        keys = list(store._entries)
+        assert len(keys) == 1 and keys[0].endswith("TopicA") is False
+
+    def test_collision_drops_stale_name_route(self, adapter):
+        store = _FakeSessionStore({
+            "agent:main:zulip:stream:7:TopicB": _FakeRouteEntry(
+                "agent:main:zulip:stream:7:TopicB", "s-old"),
+        })
+        adapter.set_session_store(store)
+        conv = adapter._conversations.lookup(7, "TopicB")
+        # Residue: a name-keyed route reappears (previous enable cycle).
+        stale_key = "agent:main:zulip:stream:7:TopicB"
+        store._entries[stale_key] = _FakeRouteEntry(stale_key, "s-stale")
+        assert adapter._migrate_legacy_topic_sessions() == 0
+        assert stale_key not in store._entries
+        assert store._entries[f"agent:main:zulip:stream:7:{conv}"].session_id == "s-old"
+
+    def test_topic_names_with_colons_survive(self, adapter):
+        old_key = "agent:main:zulip:stream:7:Deploy: XY"
+        store = _FakeSessionStore({old_key: _FakeRouteEntry(old_key, "s-colon")})
+        adapter.set_session_store(store)
+        conv = adapter._conversations.lookup(7, "Deploy: XY")
+        assert conv is not None
+        assert f"agent:main:zulip:stream:7:{conv}" in store._entries
+
+    def test_missing_store_is_skipped_safely(self, adapter):
+        adapter._session_store = None
+        assert adapter._migrate_legacy_topic_sessions() == 0
+        adapter._session_store = object()  # incompatible surface
+        assert adapter._migrate_legacy_topic_sessions() == 0
 
