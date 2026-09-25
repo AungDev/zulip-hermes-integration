@@ -1,6 +1,6 @@
 """Tests for stable topic sessions — rename-proof conversation identity.
 
-Implements the routing rules R1-R8 from the project DESIGN.md:
+Implements the routing rules R1-R10 from the project docs (ISSUE.md):
 
 - R1: unmapped topic mints a new conversation id; label reuse after a
   rename starts a NEW conversation.

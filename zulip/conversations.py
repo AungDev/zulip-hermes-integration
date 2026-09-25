@@ -6,23 +6,32 @@ opaque, stable ``conversation_id`` per conversation and tracks the mapping
 ``(channel_id, topic_name) -> conversation_id`` so Hermes sessions survive
 topic renames.
 
-Routing rules implemented here (see DESIGN.md in the project docs):
+Routing rules implemented here (see ISSUE.md in the project docs):
 
 - R1 ``resolve``: unknown name -> mint a new conversation id (label reuse
   after a rename therefore starts a NEW conversation).
 - R2 ``repoint``: full rename (``propagate_mode=change_all``) moves the
-  conversation to the new name and frees the old name (tombstoned).
-- R3: partial moves (``change_one``/``change_later``) are NOT registry
-  operations — the caller simply does not call this store for them; the new
-  name resolves to a new conversation on its first message.
+  conversation to the new name; the old name keeps only a NULL-membership
+  audit row (no beneficiary — a recreated old name cannot adopt it).
+- R3: partial moves (``change_one``/``change_later``, any channel) are NOT
+  registry operations — the caller simply does not call this store for
+  them; the source topic keeps its session and the new name resolves to a
+  new conversation on its first message.
 - R5 collisions: renaming onto a live name displaces the previous mapping
-  (tombstoned) so the renamed conversation takes the name.
-- R7 ``rebind``: manual ``/continue`` re-binds a topic to a tombstoned
-  conversation (consuming the tombstone).
-- R8 ``free``: cross-channel moves free the old mapping without mapping a
-  new one.
+  into the target topic's own session set (a former member) so the renamed
+  conversation takes the name.
+- R7 ``rebind``: manual ``/continue <session-id>`` re-binds a topic to a
+  FORMER member of its own session set (inheritance-scoped: own sessions
+  plus full-rename/merge inheritance; never a session held elsewhere or
+  orphaned).
+- R8 ``free``: full cross-channel moves free the old mapping without a
+  successor — the session set has no beneficiary and is orphaned.
+- R9 ``sessions_for_topic``: the topic's session set for ``/topic-sessions``.
+- R10 ``orphan_topic_sessions``: a topic deleted without rename/merge has
+  no beneficiary — its whole session set is orphaned (membership NULL).
 
-Tombstones power ``/continue`` and make label-reuse disambiguation auditable.
+Former-session records power ``/continue`` and make label-reuse
+disambiguation auditable.
 """
 
 import logging
@@ -122,8 +131,9 @@ class TopicConversationRegistry:
     ) -> str:
         """Return the conversation id for a topic name, minting one (R1).
 
-        Minting replaces any tombstone for the name: label reuse after a
-        rename starts a NEW conversation.
+        Label reuse after a rename starts a NEW conversation: minting
+        never adopts a previous incarnation's sessions (they were
+        inherited by the rename beneficiary or orphaned).
         """
 
         with self._lock, self._conn:
@@ -169,10 +179,14 @@ class TopicConversationRegistry:
     def repoint(self, channel_id: int, old_name: str, new_name: str) -> Optional[str]:
         """Full rename (R2): move the conversation to ``new_name``.
 
-        Frees ``old_name`` (tombstoned). If ``new_name`` was mapped to a
-        different conversation, that mapping is displaced (tombstoned, R5).
-        Returns the conversation id, or None when ``old_name`` is unmapped
-        (nothing to re-point).
+        The conversation (and its former-session set) is inherited by the
+        beneficiary ``new_name``; ``old_name`` keeps only a
+        NULL-membership audit row (no beneficiary — a recreated old name
+        cannot adopt the session). If ``new_name`` was mapped to a
+        different conversation, that mapping is displaced into the
+        target's own session set (a former member, R5). Returns the
+        conversation id, or None when ``old_name`` is unmapped (nothing
+        to re-point).
         """
 
         with self._lock, self._conn:
@@ -295,10 +309,10 @@ class TopicConversationRegistry:
 
         A conversation belongs to at most one topic, so a re-bind is a
         MOVE: if the conversation is live under another name in this
-        channel, it departs from there (that topic keeps it as a
-        tombstoned former session). Any live mapping displaced at the
-        target name is tombstoned first, and the conversation's own
-        tombstones are consumed on arrival.
+        channel, it departs from there (that topic keeps it as a former
+        session). Any live mapping displaced at the target name becomes a
+        former member of the topic's own set, and the conversation's
+        former-member record here is consumed on arrival.
         """
 
         with self._lock, self._conn:

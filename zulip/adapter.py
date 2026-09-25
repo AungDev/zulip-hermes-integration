@@ -1093,9 +1093,11 @@ class ZulipAdapter(BasePlatformAdapter):
     def _handle_topic_update(self, event: dict) -> None:
         """Registry maintenance for topic renames/moves (stable topic sessions).
 
-        Implements R2/R5 (full rename re-points and frees the old name), R3
-        (partial moves are splits: no registry change) and R8 (cross-channel
-        moves free the mapping). Never raises.
+        Implements R2/R5 (full rename re-points; the old name keeps only a
+        NULL-membership audit row), R3 (partial moves, on any channel, are
+        splits: no registry change — the source topic keeps its session)
+        and R8 (FULL cross-channel moves free the mapping; the freed set is
+        orphaned). Never raises.
         """
         if self._conversations is None:
             return
@@ -1127,7 +1129,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 return  # same-topic touch (e.g. content edit)
             if propagate_mode == "change_all":
                 # R2: full rename — the conversation moves to the new name;
-                # the old name is freed (tombstoned).
+                # the old name keeps only a NULL-membership audit row.
                 moved = self._conversations.repoint(stream_id, orig_subject, subject)
                 if moved:
                     logger.debug(
@@ -1251,9 +1253,9 @@ class ZulipAdapter(BasePlatformAdapter):
     def _topic_sessions_command_reply(self, stream_id: int, topic: str) -> str:
         """``/topic-sessions`` (topic sessions): list this topic's session set.
 
-        Read-only listing: the current session plus every former session
-        (tombstoned member), each labeled with the topic where it was
-        created. Bindings are not changed; ``/continue`` (R7) switches.
+        Read-only listing: the current session plus every former session,
+        each labeled with the topic where it was created. Bindings are
+        not changed; ``/continue <session-id>`` (R7) switches.
         """
 
         if self._conversations is None:
@@ -1279,7 +1281,7 @@ class ZulipAdapter(BasePlatformAdapter):
             lines.append(f'◦ `{_short(member_id)}` — started in "{member_origin}"')
         if members:
             lines.append("")
-            lines.append("`/continue` switches to the most recent former session.")
+            lines.append("`/continue <session-id>` switches to a former session.")
         logger.debug(
             "zulip /topic-sessions listing [channel=%s topic=%r count=%d]",
             stream_id, mask_pii(topic), total,
