@@ -832,9 +832,11 @@ class TestTopicDeletionOrphaning:
     whole session set is orphaned (unreachable by /continue from any
     topic) and a recreated same-name topic starts a fresh lineage.
 
-    The delete_message event is only a TRIGGER; the channel's topic list
-    (get_stream_topics) is the authority, so a partial bulk delete (2 of
-    9 messages) never orphans a living topic."""
+    ANY delete_message event on a mapped topic triggers a verification
+    (single-message deletes included — a topic emptied message-by-message
+    is caught by its final delete); the channel's topic list
+    (get_stream_topics) is the authority, so a partial delete (2 of 9
+    messages) never orphans a living topic."""
 
     @staticmethod
     def _delete_event(topic, message_ids, event_id=50):
@@ -904,26 +906,47 @@ class TestTopicDeletionOrphaning:
         assert adapter._conversations.lookup(7, "deploys") == conv
 
     @pytest.mark.asyncio
-    async def test_single_non_anchor_delete_never_verifies(self, adapter, monkeypatch):
+    async def test_single_delete_verifies_topic_present_ignored(self, adapter):
+        # A single (non-bulk) delete triggers verification; a topic that
+        # still exists is never orphaned — partial wipes change nothing.
         await adapter._handle_message(_stream_msg("deploys", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
         adapter.handle_message.reset_mock()
-        probe = AsyncMock()
-        monkeypatch.setattr(adapter, "_apply_topic_deletion", probe)
+        adapter.client._client.stream_topics[7] = ["deploys"]  # still exists
         adapter._handle_message_delete_event(self._delete_event("deploys", [999]))
-        probe.assert_not_called()  # no verification, nothing touched
+        await adapter._apply_topic_deletion(7, "deploys")
+        assert adapter._conversations.lookup(7, "deploys") == conv
 
     @pytest.mark.asyncio
-    async def test_anchor_single_delete_verifies_and_orphans(self, adapter):
-        # A one-message topic whose only (anchor) message is deleted.
-        queued = _stream_msg("solo", msg_id=41)
-        adapter._pre_resolve_conversation(queued, "41")
-        conv = adapter._conversations.lookup(7, "solo")
-        assert conv is not None
-        assert adapter._conversations.anchor_of(7, "solo") == 41
-        adapter.client._client.stream_topics[7] = ["other-topic"]  # "solo" gone
-        adapter._handle_message_delete_event(self._delete_event("solo", [41]))
-        await adapter._apply_topic_deletion(7, "solo")
-        assert adapter._conversations.lookup(7, "solo") is None
+    async def test_topic_emptied_by_single_deletes_orphans_on_final_delete(self, adapter):
+        # The anchor-first gap, closed: the anchor message is deleted
+        # FIRST (topic still has messages — ignored), then the remaining
+        # messages one by one. Each single delete verifies; the final one
+        # finds the topic gone from the channel's topic list and orphans.
+        await adapter._handle_message(_stream_msg("deploys", msg_id=41))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        for i in range(42, 46):  # 4 more messages -> 5 total
+            await adapter._handle_message(_stream_msg("deploys", msg_id=i))
+            adapter.handle_message.reset_mock()
+        # Anchor (41) deleted first: topic still exists -> ignored.
+        adapter.client._client.stream_topics[7] = ["deploys"]
+        adapter._handle_message_delete_event(self._delete_event("deploys", [41], event_id=60))
+        await adapter._apply_topic_deletion(7, "deploys")
+        assert adapter._conversations.lookup(7, "deploys") == conv  # mapping kept
+        # Singles 42..44: topic still exists -> ignored.
+        for mid in (42, 43, 44):
+            adapter._handle_message_delete_event(
+                self._delete_event("deploys", [mid], event_id=60 + mid)
+            )
+            await adapter._apply_topic_deletion(7, "deploys")
+        assert adapter._conversations.lookup(7, "deploys") == conv
+        # Final single delete (45): the topic is gone from the list.
+        adapter.client._client.stream_topics[7] = []
+        adapter._handle_message_delete_event(self._delete_event("deploys", [45], event_id=105))
+        await adapter._apply_topic_deletion(7, "deploys")
+        # Orphaned: no beneficiary — recreate starts fresh.
+        assert adapter._conversations.lookup(7, "deploys") is None
         assert adapter._conversations.current_name(7, conv) is None
 
     @pytest.mark.asyncio

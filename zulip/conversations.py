@@ -472,17 +472,6 @@ class TopicConversationRegistry:
             )
             return int(cur.rowcount or 0)
 
-    def anchor_of(self, channel_id: int, topic_name: str) -> Optional[int]:
-        """The topic's stored anchor message id (deletion-detection trigger)."""
-
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT anchor_message_id FROM topic_map"
-                " WHERE account_id=? AND channel_id=? AND topic_name=?",
-                (self.account_id, channel_id, topic_name),
-            ).fetchone()
-            return int(row[0]) if row is not None and row[0] is not None else None
-
     # -- R8 ----------------------------------------------------------------
 
     def free(self, channel_id: int, topic_name: str) -> Optional[str]:

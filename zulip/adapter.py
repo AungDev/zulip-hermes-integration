@@ -1350,16 +1350,17 @@ class ZulipAdapter(BasePlatformAdapter):
         )
 
     async def _handle_message_delete_event(self, event: dict) -> None:
-        """R10 trigger: a ``delete_message`` event that *may* mean a topic
-        was deleted.
+        """R10 trigger: a ``delete_message`` event on a mapped topic.
 
-        The event alone cannot distinguish "some messages deleted" from
-        "the topic deleted" (partial bulk deletes exist — deleting 2 of 9
-        messages is bulk but not a topic deletion), so the event only
-        triggers a verification; the channel's topic list
-        (``get_stream_topics``) is the authority: a topic exists while it
-        has messages. Fail-open: on any verification problem the mapping
-        stays.
+        ANY delete event on a mapped stream topic triggers a verification
+        — single-message deletes included, so a topic emptied message-by-
+        message (whatever the delete order, anchor first or last) is
+        detected by its final delete. The event itself cannot tell a
+        topic deletion from a partial one (partial bulk deletes exist —
+        deleting 2 of 9 messages is bulk but not a topic deletion), so
+        the channel's topic list (``get_stream_topics``) is the
+        authority: a topic exists while it has messages. Fail-open: on
+        any verification problem the mapping stays.
         """
         if self._conversations is None:
             return
@@ -1370,20 +1371,6 @@ class ZulipAdapter(BasePlatformAdapter):
         if not isinstance(stream_id, int) or not topic:
             return
         if self._conversations.lookup(stream_id, topic) is None:
-            return
-        message_ids = event.get("message_ids") or []
-        bulk = len(message_ids) > 1
-        anchor = self._conversations.anchor_of(stream_id, topic)
-        anchor_hit = bool(
-            not bulk
-            and anchor is not None
-            and any(
-                str(mid) == str(anchor)
-                for mid in message_ids
-                if str(mid).lstrip("-").isdigit()
-            )
-        )
-        if not bulk and not anchor_hit:
             return
         asyncio.create_task(self._apply_topic_deletion(stream_id, topic))
 
