@@ -178,7 +178,7 @@ class TestRegistryStore:
             " WHERE channel_id=7 AND conversation_id=?",
             (conv,),
         ).fetchone()
-        assert row is None or row[0] is None  # never a live candidate
+        assert row is not None and row[0] is None  # orphaned audit row
         assert registry.free(7, "deploys") is None  # idempotent
 
     def test_persists_across_instances(self, tmp_path):
@@ -678,6 +678,18 @@ class TestLegacySessionMigration:
         old_key = "agent:main:zulip:stream:7:Discuss about XY"
         dm_key = "agent:main:zulip:dm:5:someone"
         conv_key = "agent:main:zulip:stream:9:cabcdef123456"
+        # The conv-keyed key is recognized via the REGISTRY: seed the
+        # conversation it references.
+        adapter._conversations.resolve(9, "Old Topic")
+        reg = adapter._conversations
+        with reg._lock, reg._conn:
+            reg._conn.execute(
+                "INSERT OR REPLACE INTO topic_map"
+                " (account_id, channel_id, topic_name, conversation_id,"
+                "  origin_name, anchor_message_id, updated_at)"
+                " VALUES (?,?,?,?,?,NULL,?)",
+                (reg.account_id, 9, "Old Topic", "cabcdef123456", "Old Topic", 1.0),
+            )
         store = _FakeSessionStore({
             old_key: _FakeRouteEntry(old_key, "s-old"),
             dm_key: _FakeRouteEntry(dm_key, "s-dm"),
@@ -730,6 +742,53 @@ class TestLegacySessionMigration:
         conv = adapter._conversations.lookup(7, "Deploy: XY")
         assert conv is not None
         assert f"agent:main:zulip:stream:7:{conv}" in store._entries
+
+    def test_id_shaped_topic_name_is_migrated_not_skipped(self, adapter):
+        # F5-2 closed: a legacy session for a topic literally named like a
+        # conversation id ("c" + 12 hex) is MIGRATED normally — the blind
+        # regex skip is gone; the registry decides. Empty registry => the
+        # tail is not a known conversation => legacy name-keyed session.
+        id_shaped = "c4f2a9b1c3d5e"
+        old_key = f"agent:main:zulip:stream:7:{id_shaped}"
+        store = _FakeSessionStore({old_key: _FakeRouteEntry(old_key, "s-shaped")})
+        adapter.set_session_store(store)
+        conv = adapter._conversations.lookup(7, id_shaped)
+        assert conv is not None and conv != id_shaped  # fresh mint under the NAME
+        new_key = f"agent:main:zulip:stream:7:{conv}"
+        assert old_key not in store._entries
+        assert store._entries[new_key].session_id == "s-shaped"  # continuity
+
+    def test_known_conversation_key_is_skipped(self, adapter):
+        # An id-shaped key whose conversation the REGISTRY knows is
+        # already conv-keyed — skipped.
+        adapter._conversations.resolve(7, "Deploy XY")
+        reg = adapter._conversations
+        with reg._lock, reg._conn:
+            reg._conn.execute(
+                "INSERT OR REPLACE INTO topic_map"
+                " (account_id, channel_id, topic_name, conversation_id,"
+                "  origin_name, anchor_message_id, updated_at)"
+                " VALUES (?,?,?,?,?,NULL,?)",
+                (reg.account_id, 7, "Deploy XY", "c4f2a9b1c3d5e", "Deploy XY", 1.0),
+            )
+        conv_key = "agent:main:zulip:stream:7:c4f2a9b1c3d5e"
+        store = _FakeSessionStore({conv_key: _FakeRouteEntry(conv_key, "s-conv")})
+        adapter.set_session_store(store)
+        assert store._entries[conv_key].session_id == "s-conv"  # untouched
+
+    def test_orphaned_conversation_key_is_skipped_on_re_enable(self, adapter):
+        # Re-enable after an observed topic deletion: the orphaned
+        # conversation has no topic_map row but IS recorded as an orphaned
+        # audit row — its conv-keyed session must be skipped, not re-minted
+        # (a recreated topic starts fresh per R4).
+        conv = adapter._conversations.resolve(7, "Gone Topic")
+        adapter._conversations.orphan_topic_sessions(7, "Gone Topic")
+        conv_key = f"agent:main:zulip:stream:7:{conv}"
+        store = _FakeSessionStore({conv_key: _FakeRouteEntry(conv_key, "s-orphan")})
+        adapter.set_session_store(store)
+        assert store._entries[conv_key].session_id == "s-orphan"  # untouched
+        # Still no mapping for the deleted topic's name.
+        assert adapter._conversations.lookup(7, "Gone Topic") is None
 
     def test_missing_store_is_skipped_safely(self, adapter):
         adapter._session_store = None

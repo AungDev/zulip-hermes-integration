@@ -304,6 +304,26 @@ class TopicConversationRegistry:
             ).fetchone()
             return str(row[0]) if row is not None else None
 
+    def has_conversation(self, channel_id: int, conversation_id: str) -> bool:
+        """Whether a conversation id is known to this registry — live
+        (topic_map) or recorded as a former/orphaned row (tombstones).
+
+        Used by the upgrade migration to tell an already-migrated
+        conv-keyed session key from a legacy name-keyed key whose topic
+        NAME happens to match the conversation-id format.
+        """
+
+        with self._lock:
+            for table in ("topic_map", "tombstones"):
+                row = self._conn.execute(
+                    f"SELECT 1 FROM {table}"
+                    " WHERE account_id=? AND channel_id=? AND conversation_id=?",
+                    (self.account_id, channel_id, conversation_id),
+                ).fetchone()
+                if row is not None:
+                    return True
+            return False
+
     def rebind(self, channel_id: int, topic_name: str, conversation_id: str) -> None:
         """Manual re-bind (R7, ``/continue``): map a topic to a conversation.
 
@@ -453,13 +473,22 @@ class TopicConversationRegistry:
 
         Removes the live mapping WITHOUT a successor tombstone and marks
         every former-session tombstone of this topic orphaned
-        (``topic_name = NULL``). Orphaned sessions are unreachable by
-        ``/continue`` from any topic — including a recreated same-name
-        topic, which starts a fresh lineage (R4). Rows are kept, never
-        deleted. Returns the number of orphaned tombstone rows.
+        (``topic_name = NULL``). The orphaned live conversation itself is
+        recorded as an orphaned row (membership NULL, origin preserved),
+        so it stays auditable and the upgrade migration can still
+        recognize its conv-keyed session key. Orphaned sessions are
+        unreachable by ``/continue`` from any topic — including a
+        recreated same-name topic, which starts a fresh lineage (R4).
+        Rows are kept, never deleted. Returns the number of orphaned
+        former-session rows (the conversation's own audit row excluded).
         """
 
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT conversation_id, origin_name FROM topic_map"
+                " WHERE account_id=? AND channel_id=? AND topic_name=?",
+                (self.account_id, channel_id, topic_name),
+            ).fetchone()
             self._conn.execute(
                 "DELETE FROM topic_map"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
@@ -470,6 +499,22 @@ class TopicConversationRegistry:
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             )
+            if row is not None:
+                # Audit row for the orphaned conversation itself (NULL
+                # membership): keeps the conversation traceable after the
+                # mapping is gone.
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO tombstones"
+                    " (account_id, channel_id, topic_name, conversation_id,"
+                    "  origin_name, freed_at) VALUES (?,?,NULL,?,?,?)",
+                    (
+                        self.account_id,
+                        channel_id,
+                        str(row[0]),
+                        str(row[1]),
+                        time.time(),
+                    ),
+                )
             return int(cur.rowcount or 0)
 
     # -- R8 ----------------------------------------------------------------
@@ -487,13 +532,14 @@ class TopicConversationRegistry:
 
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT conversation_id FROM topic_map"
+                "SELECT conversation_id, origin_name FROM topic_map"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             ).fetchone()
             if row is None:
                 return None
             conversation_id = str(row[0])
+            origin_name = str(row[1])
             self._conn.execute(
                 "DELETE FROM topic_map"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
@@ -504,5 +550,14 @@ class TopicConversationRegistry:
                 "UPDATE tombstones SET topic_name=NULL"
                 " WHERE account_id=? AND channel_id=? AND conversation_id=?",
                 (self.account_id, channel_id, conversation_id),
+            )
+            # Audit row for the orphaned conversation itself (NULL
+            # membership): keeps it traceable after the mapping is gone.
+            self._conn.execute(
+                "INSERT OR REPLACE INTO tombstones"
+                " (account_id, channel_id, topic_name, conversation_id,"
+                "  origin_name, freed_at) VALUES (?,?,NULL,?,?,?)",
+                (self.account_id, channel_id, conversation_id, origin_name,
+                 time.time()),
             )
             return conversation_id

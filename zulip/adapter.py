@@ -1197,11 +1197,14 @@ class ZulipAdapter(BasePlatformAdapter):
 
         The registry is seeded with the (topic -> conversation) mapping in
         the same pass; transcripts are untouched (the session id does not
-        change, only its routing key). Idempotent: conv-keyed entries are
-        recognized and skipped; a name-keyed route whose conv-keyed
-        successor already exists (previous enable cycle) is dropped as
-        stale. Runs before the first message flows (the gateway wires
-        ``set_session_store`` during adapter setup).
+        change, only its routing key). Idempotent: a tail matching the
+        conversation-id format is skipped only when the REGISTRY knows
+        that conversation (live row or orphaned audit row) — an id-shaped
+        tail the registry does not know is a legacy session for a topic
+        literally named like an id, and migrates normally. A name-keyed
+        route whose conv-keyed successor already exists (previous enable
+        cycle) is dropped as stale. Runs before the first message flows
+        (the gateway wires ``set_session_store`` during adapter setup).
 
         Uses the store's routing internals (``_entries``/``_save`` under
         ``_lock``) the same way the store's own ``rekey_profile_routing``
@@ -1223,7 +1226,17 @@ class ZulipAdapter(BasePlatformAdapter):
             moves = []
             for key, entry in list(entries.items()):
                 m = _LEGACY_ZULIP_STREAM_KEY.match(key)
-                if m is None or _CONVERSATION_ID_RE.fullmatch(m["topic"]):
+                if m is None:
+                    continue
+                if _CONVERSATION_ID_RE.fullmatch(m["topic"]) and (
+                    self._conversations.has_conversation(
+                        int(m["channel"]), m["topic"]
+                    )
+                ):
+                    # Registry knows this conversation: the key is already
+                    # conv-keyed. An unknown id-shaped tail falls through —
+                    # it is a legacy session for a topic literally named
+                    # like a conversation id, and migrates normally.
                     continue
                 conversation_id = self._conversations.resolve(
                     int(m["channel"]), m["topic"]
