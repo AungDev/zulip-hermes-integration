@@ -972,3 +972,81 @@ class TestTopicDeletionOrphaning:
         )
         # Nothing mapped: no verification task, no state change anywhere.
         assert adapter._conversations.lookup(7, "ghost") is None
+
+
+class TestIdShapedTopicNameProbe:
+    """F5-2 verification: a topic literally named like a conversation id
+    ("c" + 12 hex) while that conversation id is held by another topic.
+
+    Key formats: legacy sessions key on the topic NAME
+    (``agent:<ns>:zulip:stream:<ch>:<topic_name>``), feature sessions on
+    the conversation ID (``agent:<ns>:zulip:stream:<ch>:<conv_id>``).
+    When the topic name is id-shaped the two tails are identical strings,
+    so the guards must come from the plugin's write paths — never from
+    string shape."""
+
+    ID_SHAPED = "c4f2a9b1c3d5e"  # "c" + 12 hex = valid conversation-id format
+    HELD_TOPIC = "Deploy XY"
+
+    def _seed_held_session(self, reg) -> None:
+        """Conversation c4f2a9b1c3d5e live at "Deploy XY" (direct row —
+        real mints are random; this forces the adversarial coincidence)."""
+        with reg._lock, reg._conn:
+            reg._conn.execute(
+                "INSERT INTO topic_map (account_id, channel_id, topic_name,"
+                " conversation_id, origin_name, anchor_message_id, updated_at)"
+                " VALUES (?,?,?,?,?,NULL,?)",
+                (reg.account_id, 7, self.HELD_TOPIC, self.ID_SHAPED,
+                 self.HELD_TOPIC, 1.0),
+            )
+        assert reg.lookup(7, self.HELD_TOPIC) == self.ID_SHAPED
+
+    @pytest.mark.asyncio
+    async def test_case1_start_does_not_access_held_session(self, adapter):
+        """Creating topic "c4f2a9b1c3d5e" must NOT bind it to the held
+        conversation of the same id: the first message mints a fresh
+        conversation, and the gateway thread_id (the session-key tail) is
+        that fresh id — never the name/held id."""
+        reg = adapter._conversations
+        self._seed_held_session(reg)
+
+        await adapter._handle_message(_stream_msg(self.ID_SHAPED, msg_id=1))
+        fresh = adapter.handle_message.call_args[0][0].source.thread_id
+        # The topic did NOT access the held session on start...
+        assert fresh != self.ID_SHAPED
+        # ...it got its own mapping under the id-shaped NAME...
+        assert reg.lookup(7, self.ID_SHAPED) == fresh
+        # ...and the session-key tail (thread_id) is the fresh id, so the
+        # gateway key is "...:7:<fresh>", NOT "...:7:c4f2a9b1c3d5e" (the
+        # held session's key).
+        assert fresh == reg.lookup(7, self.ID_SHAPED)
+        # The held session is untouched.
+        assert reg.lookup(7, self.HELD_TOPIC) == self.ID_SHAPED
+        assert reg.current_name(7, self.ID_SHAPED) == self.HELD_TOPIC
+        # The id-shaped topic's own set is empty — nothing reachable.
+        _cur, _org, members = reg.sessions_for_topic(7, self.ID_SHAPED)
+        assert members == []
+
+    @pytest.mark.asyncio
+    async def test_case2_continue_cannot_steal_held_session(self, adapter):
+        """/continue <held-id> inside the id-shaped topic is rejected —
+        the candidate set is the topic's own, not any id-shaped match."""
+        reg = adapter._conversations
+        self._seed_held_session(reg)
+        await adapter._handle_message(_stream_msg(self.ID_SHAPED, msg_id=1))
+        fresh = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+
+        # The theft attempt.
+        await adapter._handle_message(
+            _stream_msg(self.ID_SHAPED, msg_id=2, content=f"/continue {self.ID_SHAPED}")
+        )
+        cmd_call = adapter.client._client._sent_messages[0]
+        assert "not part of this topic's session set" in cmd_call["content"]
+
+        # Nothing moved: the held session is still live at "Deploy XY"...
+        assert reg.lookup(7, self.HELD_TOPIC) == self.ID_SHAPED
+        assert reg.current_name(7, self.ID_SHAPED) == self.HELD_TOPIC
+        # ...and the id-shaped topic still routes to its own session.
+        await adapter._handle_message(_stream_msg(self.ID_SHAPED, msg_id=3))
+        assert adapter.handle_message.call_args[0][0].source.thread_id == fresh
