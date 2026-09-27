@@ -488,6 +488,25 @@ _LEGACY_ZULIP_STREAM_KEY = re.compile(
 _CONVERSATION_ID_RE = re.compile(r"^c[0-9a-f]{12}$")
 
 
+def _split_session_key_tail(tail: str) -> tuple[str, Optional[str]]:
+    """Split a legacy session-key tail into ``(head, user_suffix)``.
+
+    The gateway appends the participant id AFTER the thread segment when
+    per-user isolation applies (``group_sessions_per_user`` /
+    ``thread_sessions_per_user``), and Zulip participant ids are emails —
+    they contain ``@`` and never contain ``:``. So when the last
+    colon-separated segment looks like an email, it is the user suffix
+    and everything before it is the topic name or conversation id (topic
+    names may themselves contain colons, e.g. ``Deploy: XY:user@x.com``).
+    Participant ids without ``@`` (non-email shapes) are not detected —
+    the Zulip adapter always uses the sender email.
+    """
+    head, sep, user = tail.rpartition(":")
+    if sep and user and "@" in user:
+        return head, user
+    return tail, None
+
+
 def _topic_sessions_enabled() -> bool:
     """Whether each Zulip topic should get its own conversation session.
 
@@ -1197,14 +1216,26 @@ class ZulipAdapter(BasePlatformAdapter):
 
         The registry is seeded with the (topic -> conversation) mapping in
         the same pass; transcripts are untouched (the session id does not
-        change, only its routing key). Idempotent: a tail matching the
-        conversation-id format is skipped only when the REGISTRY knows
-        that conversation (live row or orphaned audit row) — an id-shaped
-        tail the registry does not know is a legacy session for a topic
-        literally named like an id, and migrates normally. A name-keyed
-        route whose conv-keyed successor already exists (previous enable
-        cycle) is dropped as stale. Runs before the first message flows
-        (the gateway wires ``set_session_store`` during adapter setup).
+        change, only its routing key). The greedy key tail is parsed
+        shape-aware (see ``_split_session_key_tail``):
+
+        - an email-shaped trailing segment is a per-user suffix
+          (``group_sessions_per_user`` / ``thread_sessions_per_user``
+          deployments) and is preserved on the re-keyed key;
+        - a head matching the conversation-id format is recognized as
+          already conv-keyed only when the REGISTRY knows that
+          conversation (live row or orphaned audit row) — an id-shaped
+          head the registry does not know is a legacy session for a topic
+          literally named like an id, and migrates normally;
+        - an email-shaped head (feature-off legacy key: the tail is the
+          sender, not a topic) is left in place — minting a topic for it
+          would create a junk conversation and rekey the session to a key
+          nothing routes to.
+
+        A name-keyed route whose conv-keyed successor already exists
+        (previous enable cycle) is dropped as stale. Runs before the
+        first message flows (the gateway wires ``set_session_store``
+        during adapter setup).
 
         Uses the store's routing internals (``_entries``/``_save`` under
         ``_lock``) the same way the store's own ``rekey_profile_routing``
@@ -1228,20 +1259,31 @@ class ZulipAdapter(BasePlatformAdapter):
                 m = _LEGACY_ZULIP_STREAM_KEY.match(key)
                 if m is None:
                     continue
-                if _CONVERSATION_ID_RE.fullmatch(m["topic"]) and (
-                    self._conversations.has_conversation(
-                        int(m["channel"]), m["topic"]
-                    )
-                ):
-                    # Registry knows this conversation: the key is already
-                    # conv-keyed. An unknown id-shaped tail falls through —
-                    # it is a legacy session for a topic literally named
-                    # like a conversation id, and migrates normally.
+                head, user_suffix = _split_session_key_tail(m["topic"])
+                if _CONVERSATION_ID_RE.fullmatch(head):
+                    if self._conversations.has_conversation(
+                        int(m["channel"]), head
+                    ):
+                        # Registry knows this conversation: the key is
+                        # already conv-keyed (with or without a per-user
+                        # suffix). An unknown id-shaped head falls through —
+                        # it is a legacy session for a topic literally named
+                        # like a conversation id, and migrates normally.
+                        continue
+                elif "@" in head:
+                    # Feature-off legacy key: the tail is the sender (a
+                    # per-stream-per-user session), not a topic name. Leave
+                    # it in place — there is no per-topic successor key for
+                    # it, and minting a topic would strand the session.
                     continue
                 conversation_id = self._conversations.resolve(
-                    int(m["channel"]), m["topic"]
+                    int(m["channel"]), head
                 )
                 new_key = f"{m['prefix']}{conversation_id}"
+                if user_suffix:
+                    # Preserve the per-user suffix so the re-keyed key
+                    # matches what the gateway will build post-enable.
+                    new_key = f"{new_key}:{user_suffix}"
                 if new_key in entries:
                     # The conv-keyed session is the successor; the name-keyed
                     # route is stale residue from a previous enable cycle.

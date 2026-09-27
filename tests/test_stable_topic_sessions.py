@@ -790,6 +790,63 @@ class TestLegacySessionMigration:
         # Still no mapping for the deleted topic's name.
         assert adapter._conversations.lookup(7, "Gone Topic") is None
 
+    def test_user_tail_session_is_left_in_place(self, adapter):
+        # Feature-off legacy shape (group_sessions_per_user default): the
+        # tail is the SENDER, not a topic. Leaving it in place avoids both
+        # the junk conversation and the rekey-to-nowhere session loss.
+        user_key = "agent:main:zulip:stream:7:user@x.com"
+        store = _FakeSessionStore({user_key: _FakeRouteEntry(user_key, "s-user")})
+        adapter.set_session_store(store)
+        # Untouched, same key, same session...
+        assert store._entries[user_key].session_id == "s-user"
+        # ...no junk topic minted for the email...
+        assert adapter._conversations.lookup(7, "user@x.com") is None
+        # ...and nothing was rekeyed (no save).
+        assert store.save_calls == 0
+
+    def test_thread_per_user_suffix_preserved_on_migration(self, adapter):
+        # thread_sessions_per_user deployment, old name-keyed era:
+        # "...:<topic>:<user>" must rekey to "...:<conv>:<user>" so the
+        # migrated key matches what the gateway builds post-enable.
+        old_key = "agent:main:zulip:stream:7:Discuss about XY:user@x.com"
+        store = _FakeSessionStore({old_key: _FakeRouteEntry(old_key, "s-tspu")})
+        adapter.set_session_store(store)
+        conv = adapter._conversations.lookup(7, "Discuss about XY")
+        new_key = f"agent:main:zulip:stream:7:{conv}:user@x.com"
+        assert old_key not in store._entries
+        assert store._entries[new_key].session_id == "s-tspu"
+
+    def test_colon_topic_with_user_suffix_preserved(self, adapter):
+        # Colon topics still split correctly: the LAST colon separates the
+        # user (emails contain no colons).
+        old_key = "agent:main:zulip:stream:7:Deploy: XY:user@x.com"
+        store = _FakeSessionStore({old_key: _FakeRouteEntry(old_key, "s-colon")})
+        adapter.set_session_store(store)
+        conv = adapter._conversations.lookup(7, "Deploy: XY")
+        new_key = f"agent:main:zulip:stream:7:{conv}:user@x.com"
+        assert store._entries[new_key].session_id == "s-colon"
+
+    def test_thread_per_user_conv_key_skipped_on_re_enable(self, adapter):
+        # Our feature + thread_sessions_per_user, disable/re-enable cycle:
+        # conv-keyed keys carry the user suffix and must be skipped via the
+        # registry (the head conversation is known).
+        conv = adapter._conversations.resolve(7, "TopicT")
+        conv_key = f"agent:main:zulip:stream:7:{conv}:user@x.com"
+        store = _FakeSessionStore({conv_key: _FakeRouteEntry(conv_key, "s-live")})
+        adapter.set_session_store(store)
+        assert store._entries[conv_key].session_id == "s-live"  # untouched
+
+    def test_id_shaped_name_with_user_suffix_migrated(self, adapter):
+        # F5-2 x thread_sessions_per_user: an id-shaped head the registry
+        # does NOT know is a legacy topic name — migrate it, suffix intact.
+        old_key = "agent:main:zulip:stream:7:c4f2a9b1c3d5e:user@x.com"
+        store = _FakeSessionStore({old_key: _FakeRouteEntry(old_key, "s-mix")})
+        adapter.set_session_store(store)
+        conv = adapter._conversations.lookup(7, "c4f2a9b1c3d5e")
+        assert conv is not None and conv != "c4f2a9b1c3d5e"
+        new_key = f"agent:main:zulip:stream:7:{conv}:user@x.com"
+        assert store._entries[new_key].session_id == "s-mix"
+
     def test_missing_store_is_skipped_safely(self, adapter):
         adapter._session_store = None
         assert adapter._migrate_legacy_topic_sessions() == 0
