@@ -1171,9 +1171,13 @@ class ZulipAdapter(BasePlatformAdapter):
 
         With stable topic sessions, ``metadata["thread_id"]`` carries a
         conversation id; map it to the conversation's CURRENT topic name (R6 —
-        an in-flight reply after a rename lands in the new name). Unknown ids
-        and registry-less runs return the raw value (legacy name-keyed
-        sessions keep working verbatim).
+        an in-flight reply after a rename lands in the new name). For a
+        conversation id that is no longer live (orphaned by a topic deletion
+        or a cross-channel move while the reply was in flight), the reply
+        lands on the conversation's LAST known topic name instead of
+        materializing a ghost topic named like the id. Unknown ids with no
+        record, and registry-less runs, return the raw value (legacy
+        name-keyed sessions keep working verbatim).
         """
         raw = _metadata_topic(metadata)
         if raw and self._conversations is not None:
@@ -1183,6 +1187,17 @@ class ZulipAdapter(BasePlatformAdapter):
                 current = None
             if current:
                 return current
+            if _CONVERSATION_ID_RE.fullmatch(raw):
+                # Conv-shaped but not live: route by the LAST known topic
+                # name from the conversation's own tombstone row (never a
+                # ghost topic named like the id). No mapping is created —
+                # the orphaned session stays unreachable (R4/R10 intact).
+                try:
+                    last = self._conversations.last_topic_of(int(stream_id), raw)
+                except (TypeError, ValueError):
+                    last = None
+                if last:
+                    return last
         return raw
 
     def _routed_topic_for_chat(self, chat_id: str, metadata: Any) -> Optional[str]:
