@@ -1013,6 +1013,27 @@ class TestF1DispatchOrderResolve:
         assert sent["topic"] == "Release XY"
 
     @pytest.mark.asyncio
+    async def test_self_message_does_not_leak_stash_entry(self, adapter):
+        """A3: the dispatch stash is popped BEFORE the self-message filter,
+        so a pre-resolved self-message cannot leak a _pending_conversations
+        entry. (The pop used to sit below the filter's early return — every
+        pre-resolved self-message leaked one entry.)"""
+        self_msg = _stream_msg("Deploy XY", msg_id=77)
+        self_msg["sender_email"] = "bot@zulip.com"  # the bot's own message
+        # Dispatch pre-resolves any stream message — self-messages included
+        # (the filter only exists in the handler) — so the stash holds it.
+        adapter._pre_resolve_conversation(self_msg, "77")
+        assert "77" in adapter._pending_conversations
+        # The handler returns early (self-message) but drains the stash.
+        await adapter._handle_message(self_msg)
+        assert "77" not in adapter._pending_conversations
+        # And nothing was processed.
+        adapter.handle_message.assert_not_called()
+        # The eager mint itself is intentional (the topic exists; the
+        # acknowledged cost of the F1 fix) — only the stash leak is a bug.
+        assert adapter._conversations.lookup(7, "Deploy XY") is not None
+
+    @pytest.mark.asyncio
     async def test_poll_loop_resolves_message_before_same_batch_rename(
         self, adapter
     ):

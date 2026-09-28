@@ -1492,20 +1492,22 @@ class ZulipAdapter(BasePlatformAdapter):
 
     async def _handle_message(self, message: dict):
         """Process incoming Zulip message."""
+        message_id = message.get("id")
+        # Pop the conversation resolved at dispatch (if any) up front —
+        # before ANY early return, the self-message filter below included —
+        # so a pre-resolved self-message cannot leak a stash entry.
+        pre_resolved_conversation = (
+            self._pending_conversations.pop(str(message_id), None)
+            if message_id is not None
+            else None
+        )
+
         # Filter self-messages to prevent loops
         if message.get("sender_email") == self.email:
             return
 
         msg_type = message.get("type")  # "stream" or "private"
         content = message.get("content", "")
-        message_id = message.get("id")
-        # F1: pop the conversation resolved at dispatch (if any) up front —
-        # before any early return — so the stash cannot leak entries.
-        pre_resolved_conversation = (
-            self._pending_conversations.pop(str(message_id), None)
-            if message_id is not None
-            else None
-        )
         sender_email = message.get("sender_email", "")
         sender_full_name = message.get("sender_full_name", "Unknown")
 
