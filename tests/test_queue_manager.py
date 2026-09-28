@@ -48,6 +48,104 @@ def mock_register():
     return fn
 
 
+class TestQueueSubscriptionValidation:
+    """A persisted queue whose subscription doesn't match the required
+    event types must be discarded and re-registered, never silently
+    reused (a stale subscription silently misses event types — e.g. a
+    queue persisted by an older plugin version that subscribed to
+    ["message"] only would never deliver update_message/delete_message)."""
+
+    def _make_manager(self, tmp_path, event_types):
+        registered = []
+
+        def register_fn():
+            registered.append(list(event_types))
+            return {"queue_id": f"fresh-{len(registered)}", "last_event_id": 7}
+
+        from zulip.queue_manager import ZulipQueueManager
+        return (
+            ZulipQueueManager(
+                account_id="test@example.com",
+                data_dir=str(tmp_path),
+                register_fn=register_fn,
+                event_types=event_types,
+            ),
+            registered,
+        )
+
+    def test_stale_subscription_is_discarded_and_reregistered(self, tmp_path):
+        import asyncio
+
+        from zulip.queue_manager import QueueMetadata
+
+        mgr, registered = self._make_manager(
+            tmp_path, ["message", "update_message", "delete_message"]
+        )
+        # A queue persisted by an older version: subscribed to less.
+        mgr.save(QueueMetadata("stale-q", 99, 0, event_types=["message"]))
+        mgr.load()  # validation happens at load; result discarded
+
+        metadata = asyncio.run(mgr.ensure_queue())
+        assert registered, "must re-register after a stale subscription"
+        assert metadata.queue_id.startswith("fresh-")
+        assert metadata.event_types == ["message", "update_message", "delete_message"]
+
+    def test_legacy_metadata_without_types_is_discarded(self, tmp_path):
+        import asyncio, json
+
+        from zulip.queue_manager import ZulipQueueManager
+
+        # Hand-written legacy file: no event_types field at all.
+        (tmp_path / "zulip_queue_test_example_com.json").write_text(
+            json.dumps({"queue_id": "legacy-q", "last_event_id": 951,
+                        "registered_at": 1})
+        )
+        registered = []
+
+        def register_fn():
+            registered.append(True)
+            return {"queue_id": "fresh-legacy", "last_event_id": 1}
+
+        mgr = ZulipQueueManager(
+            account_id="test@example.com",
+            data_dir=str(tmp_path),
+            register_fn=register_fn,
+            event_types=["message", "update_message", "delete_message"],
+        )
+        metadata = asyncio.run(mgr.ensure_queue())
+        assert registered, "legacy queue file must be re-registered"
+        assert metadata.queue_id == "fresh-legacy"
+
+    def test_matching_subscription_is_reused(self, tmp_path):
+        import asyncio
+
+        from zulip.queue_manager import QueueMetadata
+
+        types = ["message", "update_message", "delete_message"]
+        mgr, registered = self._make_manager(tmp_path, types)
+        mgr.save(QueueMetadata("good-q", 42, 0, event_types=types))
+        assert mgr.load() is not None
+
+        metadata = asyncio.run(mgr.ensure_queue())
+        assert not registered, "matching subscription must be reused"
+        assert metadata.queue_id == "good-q"
+
+    def test_roundtrip_keeps_event_types(self, tmp_path):
+        import json
+
+        from zulip.queue_manager import QueueMetadata
+
+        types = ["message", "update_message", "delete_message"]
+        m = QueueMetadata("q1", 5, 0, event_types=types)
+        restored = QueueMetadata.from_dict(json.loads(json.dumps(m.to_dict())))
+        assert restored.event_types == types
+
+        legacy = QueueMetadata.from_dict(
+            {"queue_id": "q2", "last_event_id": 5, "registered_at": 0}
+        )
+        assert legacy.event_types == []
+
+
 class TestZulipQueueManager:
     def test_load_from_disk(self, tmp_data_dir, mock_register):
         # Pre-seed a queue file

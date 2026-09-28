@@ -631,13 +631,19 @@ class ZulipAdapter(BasePlatformAdapter):
         )
 
         # Persistent queue and dedupe
+        self._required_event_types = [
+            "message",
+            "update_message",
+            "delete_message",
+        ]
         self._queue_mgr = ZulipQueueManager(
             account_id=self.email or "default",
             data_dir=self._data_dir,
             register_fn=lambda: self.client.register(
-                event_types=["message", "update_message", "delete_message"],
+                event_types=self._required_event_types,
                 fetch_event_id=0,
             ),
+            event_types=self._required_event_types,
         )
         self._dedupe = ZulipDedupeStore(
             account_id=self.email or "default",

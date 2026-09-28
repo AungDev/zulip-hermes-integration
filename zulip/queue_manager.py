@@ -18,18 +18,32 @@ logger = logging.getLogger(__name__)
 
 
 class QueueMetadata:
-    """Represents persisted queue state."""
+    """Represents persisted queue state.
 
-    def __init__(self, queue_id: str, last_event_id: int, registered_at: int = 0):
+    ``event_types`` records the subscription the queue was registered
+    with, so a stale persisted queue (e.g. written by an older plugin
+    version that subscribed to fewer event types) can be detected and
+    re-registered instead of silently missing event types.
+    """
+
+    def __init__(
+        self,
+        queue_id: str,
+        last_event_id: int,
+        registered_at: int = 0,
+        event_types: Optional[list] = None,
+    ):
         self.queue_id = queue_id
         self.last_event_id = last_event_id
         self.registered_at = registered_at or int(time.time() * 1000)
+        self.event_types = list(event_types) if event_types is not None else []
 
     def to_dict(self) -> dict:
         return {
             "queue_id": self.queue_id,
             "last_event_id": self.last_event_id,
             "registered_at": self.registered_at,
+            "event_types": self.event_types,
         }
 
     @classmethod
@@ -38,6 +52,7 @@ class QueueMetadata:
             queue_id=data["queue_id"],
             last_event_id=data["last_event_id"],
             registered_at=data.get("registered_at", 0),
+            event_types=data.get("event_types") or [],
         )
 
 
@@ -49,10 +64,12 @@ class ZulipQueueManager:
         account_id: str,
         data_dir: str,
         register_fn: Callable[[], dict],
+        event_types: Optional[list] = None,
     ):
         self.account_id = account_id
         self._data_dir = Path(data_dir).expanduser()
         self._register_fn = register_fn
+        self._event_types = list(event_types) if event_types is not None else None
         self._current_queue: Optional[QueueMetadata] = None
         self._registration_promise: Optional[asyncio.Future] = None
         # Debounced save state
@@ -71,6 +88,18 @@ class ZulipQueueManager:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             metadata = QueueMetadata.from_dict(data)
+            if self._event_types is not None and (
+                metadata.event_types != self._event_types
+            ):
+                logger.warning(
+                    "zulip queue subscription changed, re-registering"
+                    " [account=%s queue_id=%s stale=%r expected=%r]",
+                    self.account_id,
+                    metadata.queue_id,
+                    metadata.event_types,
+                    self._event_types,
+                )
+                return None
             logger.info(
                 "zulip queue loaded [account=%s queue_id=%s last_event_id=%d]",
                 self.account_id,
@@ -144,6 +173,7 @@ class ZulipQueueManager:
                 metadata = QueueMetadata(
                     queue_id=result["queue_id"],
                     last_event_id=result["last_event_id"],
+                    event_types=self._event_types or [],
                 )
                 self.save(metadata)
                 logger.info(
