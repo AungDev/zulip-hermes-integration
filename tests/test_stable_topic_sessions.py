@@ -719,6 +719,29 @@ class TestContinueCommand:
         assert "/continue" in reply
 
     @pytest.mark.asyncio
+    async def test_sessions_list_shows_full_conversation_ids(self, adapter):
+        """/topic-sessions renders the FULL conversation id (`c` + 12 hex) —
+        the exact token `/continue` accepts — never a truncated prefix."""
+        import re
+
+        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
+        await adapter._handle_message(_stream_msg("Fix XY", msg_id=2))
+        adapter._handle_topic_update(_rename_event("Fix XY", "Deploy XY"))
+        await adapter._handle_message(
+            _stream_msg("Deploy XY", msg_id=3, content="/topic-sessions")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        current, _origin, members = adapter._conversations.sessions_for_topic(
+            7, "Deploy XY"
+        )
+        expected = {current} | {member_id for member_id, _ in members}
+        # every listed id is the full c+12-hex token
+        rendered = re.findall(r"`(c[0-9a-f]{12})`", reply)
+        assert set(rendered) == expected
+        # no 9-char (exactly-9-between-backticks) short tokens anywhere
+        assert not re.findall(r"`c[0-9a-f]{9}`", reply)
+
+    @pytest.mark.asyncio
     async def test_sessions_passthrough_when_disabled(
         self, mock_platform_config, monkeypatch, tmp_path
     ):

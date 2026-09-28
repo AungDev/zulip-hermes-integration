@@ -1347,20 +1347,20 @@ class ZulipAdapter(BasePlatformAdapter):
         )
         total = len(members) + (1 if current_id is not None else 0)
 
-        def _short(conversation_id: str) -> str:
-            return conversation_id[:9]
-
         lines = [f"📋 Sessions for this topic: {total}", ""]
         if current_id is not None:
             lines.append(
-                f"▸ `{_short(current_id)}` **(current)**"
+                f"▸ `{current_id}` **(current)**"
                 f' — started in "{current_origin}"'
             )
         for member_id, member_origin in members:
-            lines.append(f'◦ `{_short(member_id)}` — started in "{member_origin}"')
+            lines.append(f'◦ `{member_id}` — started in "{member_origin}"')
         if members:
             lines.append("")
-            lines.append("`/continue <session-id>` switches to a former session.")
+            lines.append(
+                "`/continue <session-id>` switches to a former session"
+                " (use the full id as listed above)."
+            )
         logger.debug(
             "zulip /topic-sessions listing [channel=%s topic=%r count=%d]",
             stream_id, mask_pii(topic), total,
