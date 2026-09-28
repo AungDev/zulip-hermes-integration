@@ -1044,8 +1044,11 @@ class ZulipAdapter(BasePlatformAdapter):
                     elif event.get("type") == "delete_message":
                         # Topic deletion (R10): the event is only a trigger;
                         # verified against the channel's topic list before
-                        # anything is freed. Async (one API call), rare.
-                        self._handle_message_delete_event(event)
+                        # anything is freed. Spawned like message handling
+                        # (one API call), rare.
+                        asyncio.create_task(
+                            self._handle_message_delete_event(event)
+                        )
 
                 # Fire-and-forget: don't await processing tasks here so the
                 # poll loop keeps fetching events. Errors are logged inside
@@ -1442,7 +1445,9 @@ class ZulipAdapter(BasePlatformAdapter):
             return
         if self._conversations.lookup(stream_id, topic) is None:
             return
-        asyncio.create_task(self._apply_topic_deletion(stream_id, topic))
+        # Awaited inline so the spawned task (see the poll loop) covers the
+        # whole chain: trigger check -> topic-list verification -> orphaning.
+        await self._apply_topic_deletion(stream_id, topic)
 
     async def _apply_topic_deletion(self, stream_id: int, topic: str) -> None:
         """Verify a deletion trigger against the channel's topic list and,

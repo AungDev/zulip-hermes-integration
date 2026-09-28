@@ -431,11 +431,14 @@ class TestOutboundRouting:
         # like the id.
         await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
         conv = adapter.handle_message.call_args[0][0].source.thread_id
-        adapter._handle_message_delete_event(
-            _delete_event(stream_id=7, topic="Deploy XY",
-                          message_ids=[1])
+        # Genuinely orphan the conversation: the topic is gone from the
+        # channel's list, and the handler runs the whole R10 chain. The
+        # assertion below then exercises the last-known-name fallback.
+        adapter.client._client.stream_topics[7] = []
+        await adapter._handle_message_delete_event(
+            _delete_event(stream_id=7, topic="Deploy XY", message_ids=[1])
         )
-        await asyncio.sleep(0)  # let the spawned R10 handler run
+        assert adapter._conversations.current_name(7, conv) is None  # orphaned
         result = await adapter.send("7", "late reply",
                                     metadata={"thread_id": conv})
         assert result.success is True
@@ -450,10 +453,11 @@ class TestOutboundRouting:
         await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
         conv = adapter.handle_message.call_args[0][0].source.thread_id
         adapter._handle_topic_update(_rename_event("Deploy XY", "Discussion XY"))
-        adapter._handle_message_delete_event(
+        adapter.client._client.stream_topics[7] = []
+        await adapter._handle_message_delete_event(
             _delete_event(stream_id=7, topic="Discussion XY", message_ids=[1])
         )
-        await asyncio.sleep(0)
+        assert adapter._conversations.current_name(7, conv) is None  # orphaned
         result = await adapter.send("7", "late reply",
                                     metadata={"thread_id": conv})
         call = adapter.client._client._sent_messages[0]
@@ -484,10 +488,11 @@ class TestOutboundRouting:
         # orphaned conversation targets the last known topic.
         await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
         conv = adapter.handle_message.call_args[0][0].source.thread_id
-        adapter._handle_message_delete_event(
+        adapter.client._client.stream_topics[7] = []
+        await adapter._handle_message_delete_event(
             _delete_event(stream_id=7, topic="Deploy XY", message_ids=[1])
         )
-        await asyncio.sleep(0)
+        assert adapter._conversations.current_name(7, conv) is None  # orphaned
         await adapter.send_typing("7", metadata={"thread_id": conv})
         call = adapter.client._client._typing_calls[-1]
         assert call["topic"] == "Deploy XY"
@@ -1056,10 +1061,10 @@ class TestTopicDeletionOrphaning:
 
         # The whole topic is deleted: absent from the channel's topic list.
         adapter.client._client.stream_topics[7] = ["Release XY"]
-        adapter._handle_message_delete_event(
+        # Await the handler itself: trigger check -> verification -> orphan.
+        await adapter._handle_message_delete_event(
             _delete_event("Discuss XY", [3, 4, 5])
         )
-        await adapter._apply_topic_deletion(7, "Discuss XY")
 
         # No beneficiary: mapping gone, set unreachable.
         assert adapter._conversations.lookup(7, "Discuss XY") is None
@@ -1086,8 +1091,7 @@ class TestTopicDeletionOrphaning:
         conv = adapter.handle_message.call_args[0][0].source.thread_id
         adapter.handle_message.reset_mock()
         adapter.client._client.stream_topics[7] = ["deploys"]  # topic still exists
-        adapter._handle_message_delete_event(_delete_event("deploys", [1, 2]))
-        await adapter._apply_topic_deletion(7, "deploys")
+        await adapter._handle_message_delete_event(_delete_event("deploys", [1, 2]))
         # Mapping and sessions intact.
         assert adapter._conversations.lookup(7, "deploys") == conv
 
@@ -1099,8 +1103,7 @@ class TestTopicDeletionOrphaning:
         conv = adapter.handle_message.call_args[0][0].source.thread_id
         adapter.handle_message.reset_mock()
         adapter.client._client.stream_topics[7] = ["deploys"]  # still exists
-        adapter._handle_message_delete_event(_delete_event("deploys", [999]))
-        await adapter._apply_topic_deletion(7, "deploys")
+        await adapter._handle_message_delete_event(_delete_event("deploys", [999]))
         assert adapter._conversations.lookup(7, "deploys") == conv
 
     @pytest.mark.asyncio
@@ -1117,20 +1120,21 @@ class TestTopicDeletionOrphaning:
             adapter.handle_message.reset_mock()
         # Anchor (41) deleted first: topic still exists -> ignored.
         adapter.client._client.stream_topics[7] = ["deploys"]
-        adapter._handle_message_delete_event(_delete_event("deploys", [41], event_id=60))
-        await adapter._apply_topic_deletion(7, "deploys")
+        await adapter._handle_message_delete_event(
+            _delete_event("deploys", [41], event_id=60)
+        )
         assert adapter._conversations.lookup(7, "deploys") == conv  # mapping kept
         # Singles 42..44: topic still exists -> ignored.
         for mid in (42, 43, 44):
-            adapter._handle_message_delete_event(
+            await adapter._handle_message_delete_event(
                 _delete_event("deploys", [mid], event_id=60 + mid)
             )
-            await adapter._apply_topic_deletion(7, "deploys")
         assert adapter._conversations.lookup(7, "deploys") == conv
         # Final single delete (45): the topic is gone from the list.
         adapter.client._client.stream_topics[7] = []
-        adapter._handle_message_delete_event(_delete_event("deploys", [45], event_id=105))
-        await adapter._apply_topic_deletion(7, "deploys")
+        await adapter._handle_message_delete_event(
+            _delete_event("deploys", [45], event_id=105)
+        )
         # Orphaned: no beneficiary — recreate starts fresh.
         assert adapter._conversations.lookup(7, "deploys") is None
         assert adapter._conversations.current_name(7, conv) is None
@@ -1145,19 +1149,77 @@ class TestTopicDeletionOrphaning:
             raise RuntimeError("network down")
 
         monkeypatch.setattr(adapter.client._client, "get_stream_topics", _boom)
-        adapter._handle_message_delete_event(_delete_event("deploys", [1, 2]))
-        # The handler swallows the verification error (fail-open, logged).
-        await adapter._apply_topic_deletion(7, "deploys")
+        # The handler runs the whole chain and swallows the verification
+        # error (fail-open, logged).
+        await adapter._handle_message_delete_event(_delete_event("deploys", [1, 2]))
         # Fail-open: the mapping is kept.
         assert adapter._conversations.lookup(7, "deploys") == conv
 
     @pytest.mark.asyncio
-    async def test_unmapped_topic_delete_event_ignored(self, adapter):
-        adapter._handle_message_delete_event(
+    async def test_unmapped_topic_delete_event_ignored(self, adapter, monkeypatch):
+        calls = []
+        orig = adapter.client._client.get_stream_topics
+
+        def _recording(stream_id):
+            calls.append(stream_id)
+            return orig(stream_id)
+
+        monkeypatch.setattr(adapter.client._client, "get_stream_topics", _recording)
+        await adapter._handle_message_delete_event(
             _delete_event("ghost", [1, 2, 3])
         )
-        # Nothing mapped: no verification task, no state change anywhere.
+        # Nothing mapped: no verification at all, no state change anywhere.
+        assert calls == []
         assert adapter._conversations.lookup(7, "ghost") is None
+
+    @pytest.mark.asyncio
+    async def test_poll_loop_orphans_on_delete_event(self, adapter):
+        """The probe_delete_trigger phase-1 scenario, as a regression pin:
+        the REAL _listen_for_events handles one delete_message event — the
+        spawned trigger task must run (topic list consulted) and the
+        mapping must be orphaned. This is the dispatch path; awaiting the
+        handler directly cannot cover it."""
+        await adapter._handle_message(_stream_msg("deploys", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+
+        client = adapter.client._client
+        client.stream_topics[7] = []  # topic genuinely gone
+        calls = []
+        orig = client.get_stream_topics
+
+        def _recording(stream_id):
+            calls.append(stream_id)
+            return orig(stream_id)
+
+        client.get_stream_topics = _recording
+        client.inject_event(_delete_event("deploys", [1], event_id=103))
+
+        adapter._listening = True
+        loop_task = asyncio.create_task(adapter._listen_for_events())
+        try:
+            orphaned = False
+            for _ in range(250):
+                await asyncio.sleep(0.02)
+                if adapter._conversations.lookup(7, "deploys") is None:
+                    orphaned = True
+                    break
+        finally:
+            adapter._listening = False
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await loop_task
+            await asyncio.sleep(0.05)  # let the spawned trigger task finish
+
+        # The trigger RAN: verification consulted the channel's topic list
+        # and the mapping was freed.
+        assert calls, "get_stream_topics was never called — trigger is dead"
+        assert orphaned
+        assert adapter._conversations.current_name(7, conv) is None
+        # Recreated topic starts fresh (R4).
+        await adapter._handle_message(_stream_msg("deploys", msg_id=9))
+        recreated = adapter.handle_message.call_args[0][0].source.thread_id
+        assert recreated != conv
 
 
 class TestIdShapedTopicNameProbe:
