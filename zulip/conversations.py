@@ -236,7 +236,10 @@ class TopicConversationRegistry:
                         new_name,
                         str(displaced[0]),
                         str(displaced[1]),
-                        str(displaced[1]),
+                        # The displaced conversation last lived at the
+                        # TARGET name — where it was pushed out of — not
+                        # at its birth topic (origin_name).
+                        new_name,
                         now,
                     ),
                 )
@@ -409,7 +412,10 @@ class TopicConversationRegistry:
                         topic_name,
                         str(displaced[0]),
                         str(displaced[1]),
-                        str(displaced[1]),
+                        # The displaced conversation last lived at the
+                        # TARGET name — where it was pushed out of — not
+                        # at its birth topic (origin_name).
+                        topic_name,
                         now,
                     ),
                 )

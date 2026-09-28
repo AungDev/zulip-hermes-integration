@@ -155,6 +155,32 @@ class TestRegistryStore:
         _cur, _org, members = registry.sessions_for_topic(7, "topic-b")
         assert [m for m, _o in members] == [conv_b]
 
+    def test_displaced_last_topic_is_where_it_last_lived(self, registry):
+        # A2: a displaced conversation's last_topic must be the name it
+        # was pushed OUT of (the displacement target) — never its birth
+        # topic. Probe-D chain: born "Old", renamed to live at
+        # "Discuss XY", then displaced by a collision there.
+        conv_old = registry.resolve(7, "Old")
+        registry.repoint(7, "Old", "Discuss XY")
+        assert registry.current_name(7, conv_old) == "Discuss XY"
+        registry.resolve(7, "Incoming")
+        # Collision: "Incoming" renames onto the live "Discuss XY" —
+        # conv_old is displaced (R5).
+        registry.repoint(7, "Incoming", "Discuss XY")
+        assert registry.current_name(7, conv_old) is None
+        assert registry.last_topic_of(7, conv_old) == "Discuss XY"  # NOT "Old"
+
+    def test_rebind_displaced_last_topic_is_target_name(self, registry):
+        # A2, rebind writer: a conversation displaced by a /continue must
+        # record the name it lived at, not its origin.
+        conv_c = registry.resolve(7, "BirthC")
+        registry.repoint(7, "BirthC", "TopicC")  # now lives at "TopicC"
+        conv_a = registry.resolve(7, "TopicA")
+        # /continue conv_a into "TopicC" displaces conv_c (R5).
+        registry.rebind(7, "TopicC", conv_a)
+        assert registry.current_name(7, conv_c) is None
+        assert registry.last_topic_of(7, conv_c) == "TopicC"  # NOT "BirthC"
+
     def test_rebind_consumes_tombstone(self, registry):
         conv = registry.resolve(7, "old-name")
         registry.free(7, "old-name")
@@ -462,6 +488,24 @@ class TestOutboundRouting:
                                     metadata={"thread_id": conv})
         call = adapter.client._client._sent_messages[0]
         assert call["topic"] == "Discussion XY"  # LAST name, not origin
+
+    @pytest.mark.asyncio
+    async def test_reply_to_displaced_conversation_lands_where_it_lived(self, adapter):
+        # A2, user-visible: a conversation displaced by an R5 collision
+        # keeps last_topic = the name it was pushed out of, so an in-flight
+        # reply lands THERE — never on its birth topic.
+        await adapter._handle_message(_stream_msg("Old", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter._handle_topic_update(_rename_event("Old", "Discuss XY"))
+        assert adapter._conversations.current_name(7, conv) == "Discuss XY"
+        # Collision: "Incoming" renames onto the live "Discuss XY".
+        await adapter._handle_message(_stream_msg("Incoming", msg_id=2))
+        adapter.handle_message.reset_mock()
+        adapter._handle_topic_update(_rename_event("Incoming", "Discuss XY"))
+        assert adapter._conversations.current_name(7, conv) is None  # displaced
+        await adapter.send("7", "late reply", metadata={"thread_id": conv})
+        call = adapter.client._client._sent_messages[0]
+        assert call["topic"] == "Discuss XY"  # last lived, NOT "Old"
 
     @pytest.mark.asyncio
     async def test_unknown_conv_id_without_record_stays_raw(self, adapter):
