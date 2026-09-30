@@ -10,6 +10,7 @@ open.
 """
 
 import asyncio
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -43,6 +44,13 @@ def adapter(mock_platform_config, monkeypatch, tmp_path):
                 return {"result": "success"}
 
     monkeypatch.setattr(adapter_module, "zulip", MockZulipModule())
+    # The live-adapter registry is module-level, so adapters built by earlier tests
+    # in the same process stay registered and can answer for this one — the handler
+    # iterates them all. That made a "wrong topic is dropped" test report success on
+    # CI, where GC timing kept a stale adapter alive. Isolate the registry.
+    monkeypatch.setattr(
+        adapter_module, "_LIVE_ADAPTERS", type(adapter_module._LIVE_ADAPTERS)()
+    )
     adapter_module._clear_caches()
 
     from zulip.adapter import ZulipAdapter
@@ -66,13 +74,10 @@ def stream_event(topic="api-review", chat_id="573423"):
 
 
 async def _settle():
-    # The trace post/edit goes through asyncio.to_thread — a real executor
-    # hop. A fixed number of loop cycles races the thread pool and flakes
-    # under load (the step is then dropped, by design, before the trace has
-    # a message id). Wait a real slice so the executor callback always lands.
-    await asyncio.sleep(0.05)
-    for _ in range(5):
-        await asyncio.sleep(0)
+    # The trace post runs through asyncio.to_thread, so a bare sleep(0) yield can
+    # return before the fake SDK call has finished. That race was invisible locally
+    # and lost on CI's slower runner, so give the worker thread a real moment.
+    await asyncio.sleep(0.15)
 
 
 async def started(adapter, topic="api-review", chat_id="573423"):
@@ -176,6 +181,89 @@ class TestAttribution:
         adapter.record_tool_step(tool_name="exec", status="ok")
         await _settle()
         assert len(adapter.client.edited) == edits_before
+
+
+class TestToolMatcher:
+    """#176: the matcher bounds which finished tools become checkpoints."""
+
+    @pytest.mark.asyncio
+    async def test_filtered_tool_produces_no_step(self, adapter):
+        adapter._trace_cfg = dataclasses.replace(
+            adapter._trace_cfg, tool_matcher="terminal"
+        )
+        await started(adapter)
+        adapter._test_context["HERMES_SESSION_CHAT_ID"] = "573423"
+        adapter._test_context["HERMES_SESSION_THREAD_ID"] = "api-review"
+
+        before = len(adapter.client.edited)
+        adapter.record_tool_step(tool_name="read", status="ok", duration_ms=5)
+        await _settle()
+
+        assert len(adapter.client.edited) == before
+
+    @pytest.mark.asyncio
+    async def test_allowed_tool_still_produces_a_step(self, adapter):
+        adapter._trace_cfg = dataclasses.replace(
+            adapter._trace_cfg, tool_matcher="terminal"
+        )
+        await started(adapter)
+        adapter._test_context["HERMES_SESSION_CHAT_ID"] = "573423"
+        adapter._test_context["HERMES_SESSION_THREAD_ID"] = "api-review"
+
+        adapter.record_tool_step(tool_name="terminal", status="ok", duration_ms=5)
+        await _settle()
+
+        assert "terminal" in adapter.client.edited[-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_exclusion_form_filters_only_that_tool(self, adapter):
+        adapter._trace_cfg = dataclasses.replace(
+            adapter._trace_cfg, tool_matcher="!read"
+        )
+        await started(adapter)
+        adapter._test_context["HERMES_SESSION_CHAT_ID"] = "573423"
+        adapter._test_context["HERMES_SESSION_THREAD_ID"] = "api-review"
+
+        before = len(adapter.client.edited)
+        adapter.record_tool_step(tool_name="read", status="ok")
+        await _settle()
+        assert len(adapter.client.edited) == before
+
+        adapter.record_tool_step(tool_name="terminal", status="ok", duration_ms=7)
+        await _settle()
+        assert "terminal" in adapter.client.edited[-1]["content"]
+
+
+class TestMatcherParsing:
+    """The matcher's rules, without the hook machinery."""
+
+    @staticmethod
+    def _cfg(matcher):
+        from zulip.activity_trace import TraceConfig
+
+        return TraceConfig(enabled=True, tool_matcher=matcher)
+
+    def test_empty_matcher_allows_everything(self):
+        assert self._cfg("").allows_tool("anything") is True
+        assert self._cfg("   ").allows_tool("") is True
+
+    def test_allowlist_admits_only_named_tools(self):
+        cfg = self._cfg("terminal,read")
+        assert cfg.allows_tool("terminal") is True
+        assert cfg.allows_tool("READ") is True  # case-insensitive
+        assert cfg.allows_tool("browser") is False
+
+    def test_allowlist_rejects_an_unknown_tool_name(self):
+        assert self._cfg("terminal").allows_tool("") is False
+
+    def test_exclusion_form_admits_everything_else(self):
+        cfg = self._cfg("!browser")
+        assert cfg.allows_tool("browser") is False
+        assert cfg.allows_tool("terminal") is True
+        assert cfg.allows_tool("") is True
+
+    def test_denial_wins_over_an_identical_allow(self):
+        assert self._cfg("terminal,!terminal").allows_tool("terminal") is False
 
 
 class TestIsolation:

@@ -53,6 +53,13 @@ def adapter(mock_platform_config, monkeypatch, tmp_path):
                 return {"result": "success"}
 
     monkeypatch.setattr(adapter_module, "zulip", MockZulipModule())
+    # The live-adapter registry is module-level, so adapters built by earlier tests
+    # in the same process stay registered and can answer for this one — the handler
+    # iterates them all. That made a "wrong topic is dropped" test report success on
+    # CI, where GC timing kept a stale adapter alive. Isolate the registry.
+    monkeypatch.setattr(
+        adapter_module, "_LIVE_ADAPTERS", type(adapter_module._LIVE_ADAPTERS)()
+    )
     adapter_module._clear_caches()
 
     from zulip.adapter import ZulipAdapter
@@ -72,14 +79,11 @@ def dm_event(chat_id="dm:42"):
 
 
 async def _settle():
-    """Let the background trace-start task run.
-
-    The trace post goes through asyncio.to_thread — a real executor hop. A
-    fixed number of loop cycles races the thread pool and flakes under load;
-    wait a real slice so the executor callback always lands."""
-    await asyncio.sleep(0.05)
-    for _ in range(5):
-        await asyncio.sleep(0)
+    """Let the background trace-start task run."""
+    # The trace post runs through asyncio.to_thread, so a bare sleep(0) yield can
+    # return before the fake SDK call has finished. That race was invisible locally
+    # and lost on CI's slower runner, so give the worker thread a real moment.
+    await asyncio.sleep(0.15)
 
 
 class TestLifecycle:
