@@ -1976,14 +1976,16 @@ class ZulipAdapter(BasePlatformAdapter):
             # Degraded (gateway store not wired): the gateway session ids
             # cannot be known, so lines render without ids rather than
             # falling back to lineage ids (plumbing, never user-facing).
+            number = 0
             if current_id is not None:
+                number += 1
                 lines.append(
-                    f"1) **(current)**"
+                    f"{number}) **(current)**"
                     f' — started in "{current_origin}"'
                 )
             for _member_id, member_origin in members:
-                lines.append(f'— started in "{member_origin}"')
-            number = len(lines)
+                number += 1
+                lines.append(f'{number}) — started in "{member_origin}"')
             body = [f"📋 Sessions in this topic: {number}"]
             if lines:
                 body += ["", *lines]

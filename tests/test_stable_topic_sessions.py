@@ -835,6 +835,30 @@ class TestContinueCommand:
         assert "live session" not in reply
 
     @pytest.mark.asyncio
+    async def test_degraded_listing_numbers_every_line(self, adapter):
+        """Degraded mode (no store) numbers all lines uniformly — the
+        current line and every member line — matching the normal listing."""
+        for i, name in enumerate(
+            ["Discuss about XY", "Fix XY", "Deploy XY"], start=1
+        ):
+            await adapter._handle_message(_stream_msg(name, msg_id=i))
+        adapter._handle_topic_update(_rename_event("Fix XY", "Discuss about XY"))
+        adapter._handle_topic_update(_rename_event("Deploy XY", "Discuss about XY"))
+        await adapter._handle_message(
+            _stream_msg("Discuss about XY", msg_id=9, content="/topic-sessions")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        assert "📋 Sessions in this topic: 3" in reply
+        assert '1) **(current)** — started in "Deploy XY"' in reply
+        # Every member line is numbered too (no unnumbered lines).
+        assert '2) — started in "Fix XY"' in reply
+        assert '3) — started in "Discuss about XY"' in reply
+        assert not any(
+            line.startswith("— started in")
+            for line in reply.split("\n")
+        )
+
+    @pytest.mark.asyncio
     async def test_continue_rejects_lineage_id(self, adapter):
         """User ruling: /continue accepts ONLY gateway session ids — a
         conversation (lineage) id is a listing label, not a switch token."""
