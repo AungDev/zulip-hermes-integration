@@ -17,6 +17,7 @@ Implements the routing rules R1-R10 from the project docs (ISSUE.md):
 import asyncio
 import contextlib
 import shutil
+import re
 import threading
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock
@@ -599,7 +600,7 @@ class TestContinueCommand:
                         content="/continue 20260928_163916_454e3786")
         )
         cmd_call = adapter.client._client._sent_messages[0]
-        assert "not part of this topic's session set" in cmd_call["content"]
+        assert "not one of this topic's sessions" in cmd_call["content"]
         # And the session is still held by "new-name".
         assert adapter._conversations.lookup(7, "new-name") == original
         assert store.switch_calls == []
@@ -622,7 +623,7 @@ class TestContinueCommand:
                         content="/continue 20260928_180039_ac06c9b7")
         )
         cmd_call = adapter.client._client._sent_messages[0]
-        assert "not part of this topic's session set" in cmd_call["content"]
+        assert "not one of this topic's sessions" in cmd_call["content"]
         # Nothing changed.
         assert adapter._conversations.lookup(7, "deploys") == conv
         assert store.switch_calls == []
@@ -635,7 +636,7 @@ class TestContinueCommand:
             _stream_msg("deploys", msg_id=2, content="/continue not-an-id")
         )
         cmd_call = adapter.client._client._sent_messages[0]
-        assert "not a gateway session id" in cmd_call["content"]
+        assert "not a session id shown by" in cmd_call["content"]
         assert adapter._conversations.lookup(7, "deploys") is not None
 
     @pytest.mark.asyncio
@@ -675,8 +676,8 @@ class TestContinueCommand:
                         content="/continue 20260928_180207_789321ca")
         )
         cmd_call = adapter.client._client._sent_messages[0]
-        assert conv_b in cmd_call["content"]
         assert "20260928_180207_789321ca" in cmd_call["content"]
+        assert 'started in **TopicB**' in cmd_call["content"]
         await adapter._handle_message(_stream_msg("TopicB", msg_id=4))
         rebound = adapter.handle_message.call_args[0][0].source.thread_id
         assert rebound == conv_b  # TopicB's old session restored
@@ -748,7 +749,7 @@ class TestContinueCommand:
             _stream_msg("Discuss about XY", msg_id=9, content="/topic-sessions")
         )
         reply = adapter.client._client._sent_messages[0]["content"]
-        assert "Sessions for this topic: 3" in reply
+        assert "Sessions in this topic: 3" in reply
         assert 'started in "Deploy XY"' in reply
         assert 'started in "Fix XY"' in reply
         assert 'started in "Discuss about XY"' in reply
@@ -756,68 +757,70 @@ class TestContinueCommand:
         assert "/continue" in reply
 
     @pytest.mark.asyncio
-    async def test_sessions_list_shows_full_conversation_ids(self, adapter):
-        """/topic-sessions renders the FULL conversation id (`c` + 12 hex) —
-        the exact token `/continue` accepts — never a truncated prefix."""
-        import re
-
-        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
-        await adapter._handle_message(_stream_msg("Fix XY", msg_id=2))
-        adapter._handle_topic_update(_rename_event("Fix XY", "Deploy XY"))
+    async def test_sessions_listing_shows_no_lineage_ids(self, adapter):
+        """User ruling: the listing never shows conversation (lineage) ids —
+        only gateway session ids, which are the switch tokens."""
+        for i, name in enumerate(
+            ["Discuss about XY", "Fix XY", "Deploy XY"], start=1
+        ):
+            await adapter._handle_message(_stream_msg(name, msg_id=i))
+        adapter._handle_topic_update(_rename_event("Fix XY", "Discuss about XY"))
+        adapter._handle_topic_update(_rename_event("Deploy XY", "Discuss about XY"))
         await adapter._handle_message(
-            _stream_msg("Deploy XY", msg_id=3, content="/topic-sessions")
+            _stream_msg("Discuss about XY", msg_id=9, content="/topic-sessions")
         )
         reply = adapter.client._client._sent_messages[0]["content"]
-        current, _origin, members = adapter._conversations.sessions_for_topic(
-            7, "Deploy XY"
-        )
-        expected = {current} | {member_id for member_id, _ in members}
-        # every listed id is the full c+12-hex token
-        rendered = re.findall(r"`(c[0-9a-f]{12})`", reply)
-        assert set(rendered) == expected
-        # no 9-char (exactly-9-between-backticks) short tokens anywhere
-        assert not re.findall(r"`c[0-9a-f]{9}`", reply)
-
+        # No c+12hex token anywhere.
+        assert not re.search(r"`c[0-9a-f]{12}`", reply)
 
     @pytest.mark.asyncio
-    async def test_sessions_listing_shows_live_session_and_generations(
-        self, adapter
-    ):
-        """P1: each lineage line carries its live gateway session id and
-        generation count (from the state-db seam)."""
-        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
-        await adapter._handle_message(_stream_msg("Fix XY", msg_id=2))
-        adapter._handle_topic_update(_rename_event("Fix XY", "Deploy XY"))
-        current, _origin, members = adapter._conversations.sessions_for_topic(
-            7, "Deploy XY"
-        )
-        convs = [current] + [m[0] for m in members]
-        keys = {
-            conv: f"agent:main:zulip:stream:7:{conv}" for conv in convs
-        }
-        sessions_by_key = {
-            keys[convs[0]]: [{"id": "20260930_131224_031f7ae1"},
-                              {"id": "20260928_180207_789321ca"}],
-            keys[convs[1]]: [{"id": "20260930_131553_13d2b944"}],
-        }
+    async def test_sessions_listing_lists_all_generations(self, adapter):
+        """The listing shows EVERY gateway session in the topic's set,
+        grouped by lineage (current first, newest first within each),
+        numbered, with (current)/(last) markers — and no lineage ids."""
+        for i, name in enumerate(
+            ["Discuss about XY", "Fix XY", "Deploy XY"], start=1
+        ):
+            await adapter._handle_message(_stream_msg(name, msg_id=i))
+        conv_d = adapter.handle_message.call_args_list[0][0][0].source.thread_id
+        conv_f = adapter.handle_message.call_args_list[1][0][0].source.thread_id
+        conv_p = adapter.handle_message.call_args_list[2][0][0].source.thread_id
+        adapter._handle_topic_update(_rename_event("Fix XY", "Discuss about XY"))
+        adapter._handle_topic_update(_rename_event("Deploy XY", "Discuss about XY"))
+        # After both merges the current lineage is Deploy XY's (last renamer).
+
+        entries = {}
+        gens = {}
+        for conv, session_ids in {
+            conv_p: ["20260930_131224_031f7ae1", "20260928_180039_ac06c9b7"],
+            conv_f: ["20260930_131553_13d2b944", "20260928_180207_789321ca"],
+            conv_d: ["20260928_183850_c08faa57"],
+        }.items():
+            key = f"agent:main:zulip:stream:7:{conv}"
+            entries[key] = _FakeRouteEntry(key, session_ids[0])
+            gens[key] = [{"id": sid} for sid in session_ids]
         store = _FakeSessionStore(
-            entries={
-                keys[convs[0]]: _FakeRouteEntry(
-                    keys[convs[0]], "20260930_131224_031f7ae1"),
-                keys[convs[1]]: _FakeRouteEntry(
-                    keys[convs[1]], "20260930_131553_13d2b944"),
-            },
-            db=_FakeSessionDB(sessions_by_key=sessions_by_key),
+            entries=entries, db=_FakeSessionDB(sessions_by_key=gens)
         )
         adapter.set_session_store(store)
+
         await adapter._handle_message(
-            _stream_msg("Deploy XY", msg_id=3, content="/topic-sessions")
+            _stream_msg("Discuss about XY", msg_id=9, content="/topic-sessions")
         )
         reply = adapter.client._client._sent_messages[0]["content"]
-        assert "live session `20260930_131224_031f7ae1`" in reply
-        assert "2 generations" in reply
-        assert "live session `20260930_131553_13d2b944`" in reply
-        assert "1 generations" in reply  # singular is fine for a pin
+        assert "📋 Sessions in this topic: 5" in reply
+        # Current lineage's live generation: line 1, (current).
+        assert '1) `20260930_131224_031f7ae1` **(current)** — started in "Deploy XY"' in reply
+        # Its older generation: unmarked.
+        assert '2) `20260928_180039_ac06c9b7` — started in "Deploy XY"' in reply
+        # Member lineage's newest generation: (last).
+        # Member lines (registry row order is not pinned — content is):
+        assert '`20260930_131553_13d2b944` **(last)** — started in "Fix XY"' in reply
+        assert '`20260928_180207_789321ca` — started in "Fix XY"' in reply
+        assert '`20260928_183850_c08faa57` **(last)** — started in "Discuss about XY"' in reply
+        # No lineage ids anywhere; footer points at /continue.
+        assert not re.search(r"`c[0-9a-f]{12}`", reply)
+        assert "Use `/continue <session-id>` to switch to another session." in reply
 
     @pytest.mark.asyncio
     async def test_sessions_listing_degrades_without_store(self, adapter):
@@ -846,8 +849,7 @@ class TestContinueCommand:
             _stream_msg("deploys", msg_id=2, content=f"/continue {conv}")
         )
         cmd_call = adapter.client._client._sent_messages[0]
-        assert "conversation (lineage) id" in cmd_call["content"]
-        assert "not switchable" in cmd_call["content"]
+        assert "not a session id shown by" in cmd_call["content"]
         # Nothing was switched or rebound.
         assert store.switch_calls == []
         assert adapter._conversations.lookup(7, "deploys") == conv
@@ -892,7 +894,7 @@ class TestContinueCommand:
         # and the gateway session was switched to the requested generation
         assert (deploy_key, dead_gen, "20260930_131553_13d2b944") in store.switch_calls
         assert f"talks in session `{dead_gen}`" in reply
-        assert f"lineage `{conv_deploy}`" in reply
+        assert 'started in **Deploy XY**' in reply
 
     @pytest.mark.asyncio
     async def test_continue_gateway_session_id_rejects_foreign_lineage(
@@ -918,7 +920,7 @@ class TestContinueCommand:
                         content="/continue 20260928_180039_ac06c9b7")
         )
         reply = adapter.client._client._sent_messages[0]["content"]
-        assert "not part of this topic's session set" in reply
+        assert "not one of this topic's sessions" in reply
         assert store.switch_calls == []
         # binding untouched
         assert adapter._conversations.lookup(7, "Deploy XY") != foreign_conv
@@ -935,7 +937,8 @@ class TestContinueCommand:
                         content="/continue 20260928_180207_789321ca")
         )
         reply = adapter.client._client._sent_messages[0]["content"]
-        assert "No gateway session" in reply
+        assert "No session" in reply
+        assert "use a session id shown by" in reply
         assert store.switch_calls == []
         assert adapter._conversations.lookup(7, "Deploy XY") is not None
 
@@ -967,7 +970,7 @@ class TestContinueCommand:
         assert adapter._conversations.lookup(7, "Deploy XY") == conv_deploy
         assert (deploy_key, "20260930_131553_13d2b944",
                 "20260930_131553_13d2b944") in store.switch_calls
-        assert f"lineage `{conv_deploy}`" in reply
+        assert 'started in **Deploy XY**' in reply
 
     @pytest.mark.asyncio
     async def test_continue_current_live_generation_is_noop(self, adapter):
@@ -1021,7 +1024,7 @@ class TestContinueCommand:
         # Topic sessions off: the plugin does not own /topic-sessions —
         # the core handler (mocked) receives it.
         sent = adapter.client._client._sent_messages
-        assert not any("Sessions for this topic" in str(m) for m in sent)
+        assert not any("Sessions in this topic" in str(m) for m in sent)
         assert core.call_args[1]["content"] == "/topic-sessions"
 
     @pytest.mark.asyncio
@@ -1035,7 +1038,7 @@ class TestContinueCommand:
             _stream_msg("Discuss about XY", msg_id=9, content="/sessions")
         )
         sent = adapter.client._client._sent_messages
-        assert not any("Sessions for this topic" in str(m) for m in sent)
+        assert not any("Sessions in this topic" in str(m) for m in sent)
         assert core.call_args[1]["content"] == "/sessions"
 
 @dataclass
@@ -1484,7 +1487,7 @@ class TestTopicDeletionOrphaning:
                         content="/continue 20260928_180039_ac06c9b7")
         )
         cmd_call = adapter.client._client._sent_messages[0]
-        assert "not part of this topic's session set" in cmd_call["content"]
+        assert "not one of this topic's sessions" in cmd_call["content"]
 
     @pytest.mark.asyncio
     async def test_partial_bulk_delete_keeps_living_topic(self, adapter):
@@ -1692,8 +1695,7 @@ class TestIdShapedTopicNameProbe:
             _stream_msg(self.ID_SHAPED, msg_id=2, content=f"/continue {self.ID_SHAPED}")
         )
         cmd_call = adapter.client._client._sent_messages[0]
-        assert "not switchable" in cmd_call["content"]
-        assert "conversation (lineage) id" in cmd_call["content"]
+        assert "not a session id shown by" in cmd_call["content"]
 
         # Nothing moved: the held session is still live at "Deploy XY"...
         assert reg.lookup(7, self.HELD_TOPIC) == self.ID_SHAPED

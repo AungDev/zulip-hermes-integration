@@ -1378,54 +1378,104 @@ class ZulipAdapter(BasePlatformAdapter):
         current_id, current_origin, members = self._conversations.sessions_for_topic(
             stream_id, topic
         )
-        total = len(members) + (1 if current_id is not None else 0)
 
         entries = self._route_entries()
         db = self._session_db()
+        store_missing = getattr(self, "_session_store", None) is None
 
-        def _gateway_bits(conversation_id: str) -> str:
-            """Live session id + generation count for one lineage (best effort)."""
+        def _lineage_sessions(conversation_id: str):
+            """All known gateway sessions of one lineage, newest first,
+            plus the currently-live id (None when the lineage has no live
+            routing entry). Users never see the lineage id itself — only
+            its gateway session ids, labeled with the lineage's origin."""
             key, entry = self._entry_for_conversation(entries, conversation_id)
-            if entry is None:
-                return ""
-            parts = [f"live session `{entry.session_id}`"]
-            if db is not None:
+            live = entry.session_id if entry is not None else None
+            ids = []
+            if db is not None and key is not None:
                 try:
                     rows = db.list_sessions_rich(
-                        session_key=key, limit=50, include_hidden=True
+                        session_key=key, limit=50,
+                        order_by_last_active=True, include_hidden=True,
                     )
-                    if rows:
-                        parts.append(f"{len(rows)} generations")
                 except Exception as exc:
                     logger.debug(
-                        "zulip generation count unavailable [conv=%s]: %s",
+                        "zulip session enumeration unavailable [conv=%s]: %s",
                         conversation_id, exc,
                     )
-            return " — " + " · ".join(parts)
+                    rows = []
+                for row in rows:
+                    sid = (row or {}).get("id") or (row or {}).get(
+                        "session_id")
+                    if sid and sid not in ids:
+                        ids.append(sid)
+            if live is not None and live not in ids:
+                ids.insert(0, live)
+            return live, ids
 
-        lines = [f"📋 Sessions for this topic: {total}", ""]
-        if current_id is not None:
-            lines.append(
-                f"▸ `{current_id}` **(current)**"
-                f' — started in "{current_origin}"'
-                f"{_gateway_bits(current_id)}"
+        # Degraded mode (gateway store not wired): the gateway session ids
+        # cannot be known, so lines render without ids rather than falling
+        # back to lineage ids (which are plumbing, never user-facing).
+        lines = []
+        if store_missing:
+            # Degraded (gateway store not wired): the gateway session ids
+            # cannot be known, so lines render without ids rather than
+            # falling back to lineage ids (plumbing, never user-facing).
+            if current_id is not None:
+                lines.append(
+                    f"1) **(current)**"
+                    f' — started in "{current_origin}"'
+                )
+            for _member_id, member_origin in members:
+                lines.append(f'— started in "{member_origin}"')
+            number = len(lines)
+            body = [f"📋 Sessions in this topic: {number}"]
+            if lines:
+                body += ["", *lines]
+            if number > 1:
+                body += [""]
+                body.append(
+                    "Use `/continue <session-id>` to switch to another"
+                    " session."
+                )
+            logger.debug(
+                "zulip /topic-sessions listing (degraded)"
+                " [channel=%s topic=%r count=%d]",
+                stream_id, mask_pii(topic), number,
             )
-        for member_id, member_origin in members:
-            lines.append(
-                f'◦ `{member_id}` — started in "{member_origin}"'
-                f"{_gateway_bits(member_id)}"
-            )
-        if members:
-            lines.append("")
-            lines.append(
-                "`/continue <id>` switches to a former session — use either"
-                " the conversation id or any listed gateway session id."
+            return "\n".join(body)
+
+        lines = []
+        number = 0
+        for is_current, origin, conv in (
+            [(True, current_origin, current_id)] if current_id is not None else []
+        ) + [(False, origin, member_id) for member_id, origin in members]:
+            live, ids = _lineage_sessions(conv)
+            for position, sid in enumerate(ids):
+                number += 1
+                if is_current and sid == live:
+                    marker = " **(current)**"
+                elif not is_current and (
+                    sid == live or (position == 0 and live is None)
+                ):
+                    marker = " **(last)**"
+                else:
+                    marker = ""
+                lines.append(
+                    f'{number}) `{sid}`{marker} — started in "{origin}"'
+                )
+        body = [f"📋 Sessions in this topic: {number}"]
+        if lines:
+            body += ["", *lines]
+        if number > 1:
+            body += [""]
+            body.append(
+                "Use `/continue <session-id>` to switch to another session."
             )
         logger.debug(
             "zulip /topic-sessions listing [channel=%s topic=%r count=%d]",
-            stream_id, mask_pii(topic), total,
+            stream_id, mask_pii(topic), number,
         )
-        return "\n".join(lines)
+        return "\n".join(body)
 
     def _continue_command_reply(
         self, stream_id: int, topic: str, arg: str = ""
@@ -1457,16 +1507,8 @@ class ZulipAdapter(BasePlatformAdapter):
         token = arg.split()[0]
         if _GATEWAY_SESSION_ID_RE.fullmatch(token):
             return self._continue_to_gateway_session(stream_id, topic, token)
-        if _CONVERSATION_ID_RE.fullmatch(token):
-            return (
-                "That is a conversation (lineage) id — lineage ids group"
-                " sessions in `/topic-sessions` but are not switchable."
-                " Use a **gateway session id** (`YYYYMMDD_HHMMSS_hex`),"
-                " as listed under each lineage. Nothing was changed."
-            )
         return (
-            "That is not a gateway session id (expected"
-            " `YYYYMMDD_HHMMSS_hex`, as shown by `/topic-sessions`)."
+            "That is not a session id shown by `/topic-sessions`."
             " Nothing was changed."
         )
 
@@ -1509,14 +1551,14 @@ class ZulipAdapter(BasePlatformAdapter):
                 key = (row or {}).get("session_key")
         if not key:
             return (
-                f"No gateway session `{session_id}` was found (live or past)."
-                " Nothing was changed."
+                f"No session `{session_id}` was found — use a session id"
+                " shown by `/topic-sessions`. Nothing was changed."
             )
         conversation_id = key.rsplit(":", 1)[-1]
         if not _CONVERSATION_ID_RE.fullmatch(conversation_id):
             return (
-                "That session does not belong to a topic-session lineage"
-                " (it is a DM or another scope). Nothing was changed."
+                "That session is not part of this topic's sessions — use a"
+                " session id shown by `/topic-sessions`. Nothing was changed."
             )
 
         # 2. Inheritance verification (R7): the conversation must be part
@@ -1535,10 +1577,9 @@ class ZulipAdapter(BasePlatformAdapter):
             }
             if conversation_id not in member_ids:
                 return (
-                    "That session is not part of this topic's session set"
-                    " (own + inherited) — a session held by another topic or"
-                    " orphaned cannot be continued. Nothing was changed."
-                    " See `/topic-sessions`."
+                    "That session is not one of this topic's sessions —"
+                    " use a session id shown by `/topic-sessions`."
+                    " Nothing was changed."
                 )
             self._conversations.rebind(stream_id, topic, conversation_id)
 
@@ -1574,7 +1615,7 @@ class ZulipAdapter(BasePlatformAdapter):
         )
         return (
             f"🔗 This topic now talks in session `{session_id}`"
-            f" (lineage `{conversation_id}`, started in **{origin}**)."
+            f', started in **{origin}**.'
         )
 
     async def _handle_message_delete_event(self, event: dict) -> None:
