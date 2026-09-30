@@ -87,6 +87,11 @@ class BasePlatformAdapter:
     def build_source(self, **kwargs):
         return MessageSource(**kwargs)
 
+    def set_session_store(self, session_store) -> None:
+        """Set the session store (mirrors the real gateway base, which the
+        gateway wires into every adapter during runner setup)."""
+        self._session_store = session_store
+
     async def handle_message(self, event: MessageEvent):
         pass
 

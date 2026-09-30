@@ -228,7 +228,7 @@ Native approval buttons rely on the gateway's `_send_exec_approval_prompt` hook,
 | `ZULIP_EDIT_PLACEHOLDER` | `true` | Show "Thinking..." placeholder while AI generates |
 | `ZULIP_REACTIONS_ENABLED` | `true` | Emoji reactions (👀/✅/⚠️) for status |
 | `ZULIP_CHUNK_LIMIT` | `4000` | Max chars per message chunk |
-| `ZULIP_TOPIC_SESSIONS` | `false` | Per-topic conversation sessions (opt-in) |
+| `ZULIP_TOPIC_SESSIONS` | `false` | Per-topic conversation sessions (rename-proof: sessions key on stable conversation ids, so renaming a topic continues its session; `/new` starts a fresh one) |
 | `ZULIP_DM_SESSION_TURN_LIMIT` | `20` | DM session rotation after N turns (0 to disable) |
 | `ZULIP_STREAMS` | `*` | Comma-separated stream names to monitor |
 | `ZULIP_RESPONSE_PREFIX` | *(empty)* | Prepended to every outbound message |

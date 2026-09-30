@@ -28,6 +28,10 @@ class MockZulipClient:
         self._sent_messages = []
         self._reactions = []
         self._uploads = []
+        # stream_id -> [topic names] for get_stream_topics (R10 deletion
+        # verification). UNCONFIGURED streams return an error result — the
+        # adapter's fail-open path keeps the mapping (safe default).
+        self.stream_topics = {}
 
     def get_server_settings(self):
         return self._server_settings
@@ -83,6 +87,12 @@ class MockZulipClient:
         self._uploads.append({"uri": uri, "file": file})
         return {"result": "success", "uri": uri}
 
+    def get_stream_topics(self, stream_id):
+        names = self.stream_topics.get(stream_id)
+        if names is None:
+            return {"result": "error", "msg": "stream topics not configured"}
+        return {"result": "success", "topics": [{"name": n} for n in names]}
+
     def inject_event(self, event):
         """Helper: queue an event for get_events to return."""
         self._events.append(event)
@@ -100,6 +110,20 @@ def clear_caches():
     _clear_caches()
     yield
 
+
+
+@pytest.fixture(autouse=True)
+def _clear_live_adapters_registry():
+    """Adapters self-register in a module-level WeakSet (tool-step
+    attribution, activity traces). A host context can outlive its test and
+    keep a stale adapter alive, whose session context then matches the NEXT
+    test and consumes its step. Clearing the registry between tests keeps
+    attribution deterministic regardless of test order."""
+    yield
+    import zulip.adapter as _adapter_module
+    live = getattr(_adapter_module, "_LIVE_ADAPTERS", None)
+    if live is not None:
+        live.clear()
 
 @pytest.fixture
 def mock_zulip_client():

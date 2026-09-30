@@ -9,9 +9,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import weakref
+from dataclasses import replace as _dc_replace
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, Any, overload
@@ -63,7 +65,8 @@ from .queue_manager import ZulipQueueManager
 from .dedupe_store import ZulipDedupeStore
 from .reactions import ReactionConfig, ReactionLifecycle
 from .version import __version__, __repo__
-from .commands import handle_command, is_command
+from .commands import CommandResult, handle_command, is_command
+from .conversations import TopicConversationRegistry
 from .policy import PolicyEngine
 from . import updater
 from .probe import (
@@ -656,6 +659,40 @@ def _metadata_topic(metadata: Any) -> Optional[str]:
     return None
 
 
+# Legacy (pre-stable-sessions) zulip stream session key:
+#   agent:<profile>:zulip:stream:<channel_id>:<topic_name>
+# The topic is everything after the channel prefix — topic names may
+# contain colons, so the tail is captured greedily.
+_LEGACY_ZULIP_STREAM_KEY = re.compile(
+    r"^(?P<prefix>agent:[^:]+:zulip:stream:(?P<channel>\d+):)(?P<topic>.+)$"
+)
+
+# Conversation ids minted by the registry ("c" + 12 hex chars) — used to
+# recognize already-migrated (conv-keyed) session keys.
+_CONVERSATION_ID_RE = re.compile(r"^c[0-9a-f]{12}$")
+# Gateway session ids: <YYYYMMDD>_<HHMMSS>_<hex> (e.g. 20260928_180207_789321ca).
+_GATEWAY_SESSION_ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]+$")
+
+
+def _split_session_key_tail(tail: str) -> tuple[str, Optional[str]]:
+    """Split a legacy session-key tail into ``(head, user_suffix)``.
+
+    The gateway appends the participant id AFTER the thread segment when
+    per-user isolation applies (``group_sessions_per_user`` /
+    ``thread_sessions_per_user``), and Zulip participant ids are emails —
+    they contain ``@`` and never contain ``:``. So when the last
+    colon-separated segment looks like an email, it is the user suffix
+    and everything before it is the topic name or conversation id (topic
+    names may themselves contain colons, e.g. ``Deploy: XY:user@x.com``).
+    Participant ids without ``@`` (non-email shapes) are not detected —
+    the Zulip adapter always uses the sender email.
+    """
+    head, sep, user = tail.rpartition(":")
+    if sep and user and "@" in user:
+        return head, user
+    return tail, None
+
+
 def _topic_sessions_enabled() -> bool:
     """Whether each Zulip topic should get its own conversation session.
 
@@ -751,6 +788,11 @@ class ZulipAdapter(BasePlatformAdapter):
         # topic sessions on, the gateway routes replies by metadata thread_id —
         # the session's own topic — never by this cache.
         self._topic_cache: dict[str, str] = {}
+        # F1: conversation ids resolved at event dispatch, keyed by message
+        # id (str). Written inline by the poll loop in event-id order;
+        # popped by _handle_message so a rename processed between dispatch
+        # and the handler's first await cannot fork the conversation.
+        self._pending_conversations: dict[str, str] = {}
         # Context-mitigation state
         self._last_topic_cache: dict[str, str] = {}      # stream_id → previous topic
         self._message_counts: dict[str, int] = {}        # chat_id → message count
@@ -797,10 +839,16 @@ class ZulipAdapter(BasePlatformAdapter):
         )
 
         # Persistent queue and dedupe
+        self._required_event_types = [
+            "message",
+            "update_message",
+            "delete_message",
+        ]
         self._queue_mgr = ZulipQueueManager(
             account_id=self.email or "default",
             data_dir=self._data_dir,
             register_fn=self._register_queue,
+            event_types=self._required_event_types,
         )
         self._dedupe = ZulipDedupeStore(
             account_id=self.email or "default",
@@ -809,6 +857,18 @@ class ZulipAdapter(BasePlatformAdapter):
             max_size=2000,
         )
         self._dedupe.load()
+
+        # Stable topic sessions: with topic sessions enabled, sessions key on
+        # a persistent conversation id — never the topic name — so renames
+        # continue the session instead of stranding it. There is no opt-out:
+        # name-keyed topic sessions are not a feature (explicit /new is the
+        # only way to start a fresh session in a topic).
+        self._conversations: Optional[TopicConversationRegistry] = None
+        if _topic_sessions_enabled():
+            self._conversations = TopicConversationRegistry(
+                account_id=self.email or "default",
+                data_dir=self._data_dir,
+            )
 
         # Reaction config
         self._reaction_cfg = ReactionConfig.from_env()
@@ -932,7 +992,7 @@ class ZulipAdapter(BasePlatformAdapter):
         runs (platform typing state expires after ~5s). Best-effort."""
         try:
             params = self._typing_params_for_chat(
-                str(chat_id), "start", topic=_metadata_topic(metadata)
+                str(chat_id), "start", topic=self._routed_topic_for_chat(str(chat_id), metadata)
             )
             if params:
                 await self._sdk_call(
@@ -952,7 +1012,7 @@ class ZulipAdapter(BasePlatformAdapter):
         """
         try:
             params = self._typing_params_for_chat(
-                str(chat_id), "stop", topic=_metadata_topic(metadata)
+                str(chat_id), "stop", topic=self._routed_topic_for_chat(str(chat_id), metadata)
             )
             if params:
                 await self._sdk_call(
@@ -989,7 +1049,14 @@ class ZulipAdapter(BasePlatformAdapter):
             return None
         if target["type"] == "dm":
             return {"type": "private", "to": target["user_ids"], "content": content}
-        topic = _metadata_topic(metadata) or self._topic_cache.get(chat_id, "general")
+        # Same resolution the reply path uses (_routed_topic): with stable
+        # topic sessions metadata.topic is a conversation id, and a raw
+        # send would materialize a ghost topic named like the id (#143 lesson:
+        # no second, drifting resolution).
+        topic = (
+            self._routed_topic(target["stream_id"], metadata)
+            or self._topic_cache.get(chat_id, "general")
+        )
         return {
             "type": "stream",
             "to": target["stream_id"],
@@ -1549,7 +1616,11 @@ class ZulipAdapter(BasePlatformAdapter):
         idle poll with our shorter generic read timeout. (Issue #146)
         """
         result = self.client.register(
-            event_types=["message"],
+            # Full subscription (message + update_message + delete_message):
+            # stable topic sessions need rename/deletion events; the queue
+            # manager validates the persisted subscription against
+            # ``event_types`` and re-registers on mismatch.
+            event_types=list(self._required_event_types),
             fetch_event_id=0,
             fetch_event_types=["realm"],
         )
@@ -1658,8 +1729,26 @@ class ZulipAdapter(BasePlatformAdapter):
                         # Process messages concurrently so a slow model call
                         # does not block the poll loop for unrelated messages.
                         # Per-session serialization is handled by the gateway.
+                        # F1 fix: resolve the topic conversation NOW, inline,
+                        # in event-id order — a rename later in this batch (or
+                        # processed while the handler awaits) must not fork
+                        # this message into a fresh conversation under the
+                        # freed name. The id is stashed; the handler reuses it.
+                        self._pre_resolve_conversation(msg, msg_id)
                         task = asyncio.create_task(self._handle_message(msg))
                         processing_tasks.append(task)
+                    elif event.get("type") == "update_message":
+                        # Topic renames/moves: registry maintenance for stable
+                        # topic sessions. Fast + ordered, handled inline.
+                        self._handle_topic_update(event)
+                    elif event.get("type") == "delete_message":
+                        # Topic deletion (R10): the event is only a trigger;
+                        # verified against the channel's topic list before
+                        # anything is freed. Spawned like message handling
+                        # (one API call), rare.
+                        asyncio.create_task(
+                            self._handle_message_delete_event(event)
+                        )
 
                 # Fire-and-forget: don't await processing tasks here so the
                 # poll loop keeps fetching events. Errors are logged inside
@@ -1690,15 +1779,635 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
                 await asyncio.sleep(5)
 
+    def _pre_resolve_conversation(self, msg: dict, msg_id: str) -> None:
+        """Resolve (mint) a stream topic's conversation at event dispatch,
+        in event-id order — the F1 fix.
+
+        `_handle_message` runs as a deferred task, so within one poll batch
+        every inline `update_message` rename applies BEFORE any message
+        task starts, and a rename can also land while a handler sits in a
+        pre-resolve await. Without eager resolution the handler's own
+        `resolve()` would then find the old name freed and mint a fresh
+        conversation under it — forking the topic's session and routing
+        the reply to the resurrected old topic.
+
+        Resolving here, inline in event-id order, makes registry
+        operations strictly follow event order for messages and renames
+        alike; `_handle_message` pops the stashed id instead of
+        re-resolving. Messages later dropped by gating still mint their
+        topic's conversation — harmless: the topic exists, so its
+        conversation exists, and no gateway session is created until a
+        message actually flows. Stash entries are popped at the top of
+        `_handle_message` (before any early return), so nothing lingers.
+        """
+        if self._conversations is None:
+            return
+        if msg.get("type") != "stream":
+            return
+        stream_id = msg.get("stream_id")
+        topic = msg.get("subject", "")
+        if not topic or not isinstance(stream_id, int):
+            return
+        try:
+            conversation_id = self._conversations.resolve(
+                stream_id,
+                topic,
+                anchor_message_id=int(msg_id) if msg_id else None,
+            )
+        except Exception:
+            logger.exception(
+                "zulip pre-dispatch conversation resolve failed [msg=%s]",
+                mask_pii(msg_id),
+            )
+            return
+        self._pending_conversations[msg_id] = conversation_id
+
+    def _handle_topic_update(self, event: dict) -> None:
+        """Registry maintenance for topic renames/moves (stable topic sessions).
+
+        Implements R2/R5 (full rename re-points; the old name keeps only a
+        NULL-membership audit row), R3 (partial moves, on any channel, are
+        splits: no registry change — the source topic keeps its session)
+        and R8 (FULL cross-channel moves free the mapping; the freed set is
+        orphaned). Never raises.
+        """
+        if self._conversations is None:
+            return
+        stream_id = event.get("stream_id")
+        orig_subject = event.get("orig_subject")
+        subject = event.get("subject")
+        propagate_mode = event.get("propagate_mode", "")
+        try:
+            if not isinstance(stream_id, int) or not orig_subject:
+                return  # content-only edit or malformed event
+            if event.get("new_stream_id") is not None:
+                # Cross-channel move. Only a FULL move (change_all) empties
+                # the source topic: R8 — free the mapping here; the new
+                # location becomes a fresh conversation, and the freed
+                # session set has no beneficiary (orphaned). A PARTIAL move
+                # (change_one/change_later) leaves the source topic alive
+                # with its remaining messages — it keeps its session
+                # (R3 semantics).
+                if propagate_mode == "change_all":
+                    freed = self._conversations.free(stream_id, orig_subject)
+                    if freed:
+                        logger.debug(
+                            "zulip conversation freed on cross-channel move"
+                            " [channel=%s conv=%s]",
+                            stream_id, freed,
+                        )
+                return
+            if not subject or subject == orig_subject:
+                return  # same-topic touch (e.g. content edit)
+            if propagate_mode == "change_all":
+                # R2: full rename — the conversation moves to the new name;
+                # the old name keeps only a NULL-membership audit row.
+                moved = self._conversations.repoint(stream_id, orig_subject, subject)
+                if moved:
+                    logger.debug(
+                        "zulip conversation repointed [channel=%s conv=%s"
+                        " old=%r new=%r]",
+                        stream_id, moved, mask_pii(orig_subject), mask_pii(subject),
+                    )
+            # R3: change_one/change_later are splits — the new name resolves
+            # to a new conversation via R1 on its next message.
+        except Exception as e:
+            logger.warning(
+                format_zulip_log(
+                    "zulip topic registry update failed",
+                    error=mask_pii(str(e)),
+                )
+            )
+
+    def _routed_topic(self, stream_id: int, metadata: Any) -> Optional[str]:
+        """Routing topic from send metadata, resolving conversation ids.
+
+        With stable topic sessions, ``metadata["thread_id"]`` carries a
+        conversation id; map it to the conversation's CURRENT topic name (R6 —
+        an in-flight reply after a rename lands in the new name). For a
+        conversation id that is no longer live (orphaned by a topic deletion
+        or a cross-channel move while the reply was in flight), the reply
+        lands on the conversation's LAST known topic name instead of
+        materializing a ghost topic named like the id. Unknown ids with no
+        record, and registry-less runs, return the raw value (legacy
+        name-keyed sessions keep working verbatim).
+        """
+        raw = _metadata_topic(metadata)
+        if raw and self._conversations is not None:
+            try:
+                current = self._conversations.current_name(int(stream_id), raw)
+            except (TypeError, ValueError):
+                current = None
+            if current:
+                return current
+            if _CONVERSATION_ID_RE.fullmatch(raw):
+                # Conv-shaped but not live: route by the LAST known topic
+                # name from the conversation's own tombstone row (never a
+                # ghost topic named like the id). No mapping is created —
+                # the orphaned session stays unreachable (R4/R10 intact).
+                try:
+                    last = self._conversations.last_topic_of(int(stream_id), raw)
+                except (TypeError, ValueError):
+                    last = None
+                if last:
+                    return last
+        return raw
+
+    def _routed_topic_for_chat(self, chat_id: str, metadata: Any) -> Optional[str]:
+        """``_routed_topic`` for chat-id strings (typing hooks)."""
+        if not chat_id.isdigit():
+            return _metadata_topic(metadata)
+        return self._routed_topic(int(chat_id), metadata)
+
+    # -- upgrade migration --------------------------------------------------
+
+    def set_session_store(self, session_store: Any) -> None:
+        super().set_session_store(session_store)
+        if self._conversations is not None:
+            try:
+                self._migrate_legacy_topic_sessions()
+            except Exception:
+                # Fail open: a failed migration must not block adapter
+                # startup; affected topics simply start fresh sessions.
+                logger.exception(
+                    "zulip legacy-session migration failed; continuing with fresh keys"
+                )
+
+    def _migrate_legacy_topic_sessions(self) -> int:
+        """One-time continuity migration (upgrade or first enable).
+
+        Re-keys existing name-keyed zulip stream sessions to the stable
+        conversation-id keys, so users keep their current sessions when
+        the feature turns on instead of starting fresh per topic:
+
+            agent:<ns>:zulip:stream:<ch>:<topic>  ->  ...:<ch>:<conv_id>
+
+        The registry is seeded with the (topic -> conversation) mapping in
+        the same pass; transcripts are untouched (the session id does not
+        change, only its routing key). The greedy key tail is parsed
+        shape-aware (see ``_split_session_key_tail``):
+
+        - an email-shaped trailing segment is a per-user suffix
+          (``group_sessions_per_user`` / ``thread_sessions_per_user``
+          deployments) and is preserved on the re-keyed key;
+        - a head matching the conversation-id format is recognized as
+          already conv-keyed only when the REGISTRY knows that
+          conversation (live row or orphaned audit row) — an id-shaped
+          head the registry does not know is a legacy session for a topic
+          literally named like an id, and migrates normally;
+        - an email-shaped head (feature-off legacy key: the tail is the
+          sender, not a topic) is left in place — minting a topic for it
+          would create a junk conversation and rekey the session to a key
+          nothing routes to.
+
+        A name-keyed route whose conv-keyed successor already exists
+        (previous enable cycle) is dropped as stale. Runs before the
+        first message flows (the gateway wires ``set_session_store``
+        during adapter setup).
+
+        Uses the store's routing internals (``_entries``/``_save`` under
+        ``_lock``) the same way the store's own ``rekey_profile_routing``
+        does — no per-key public rekey API exists on the store yet;
+        revisit on gateway upgrades.
+        """
+        if self._conversations is None:
+            return 0
+        store = getattr(self, "_session_store", None)
+        entries = getattr(store, "_entries", None)
+        lock = getattr(store, "_lock", None)
+        save = getattr(store, "_save", None)
+        if entries is None or lock is None or save is None:
+            logger.debug(
+                "zulip legacy-session migration skipped: no compatible session store"
+            )
+            return 0
+        with lock:
+            moves = []
+            for key, entry in list(entries.items()):
+                m = _LEGACY_ZULIP_STREAM_KEY.match(key)
+                if m is None:
+                    continue
+                head, user_suffix = _split_session_key_tail(m["topic"])
+                if _CONVERSATION_ID_RE.fullmatch(head):
+                    if self._conversations.has_conversation(
+                        int(m["channel"]), head
+                    ):
+                        # Registry knows this conversation: the key is
+                        # already conv-keyed (with or without a per-user
+                        # suffix). An unknown id-shaped head falls through —
+                        # it is a legacy session for a topic literally named
+                        # like a conversation id, and migrates normally.
+                        continue
+                elif "@" in head:
+                    # Feature-off legacy key: the tail is the sender (a
+                    # per-stream-per-user session), not a topic name. Leave
+                    # it in place — there is no per-topic successor key for
+                    # it, and minting a topic would strand the session.
+                    continue
+                conversation_id = self._conversations.resolve(
+                    int(m["channel"]), head
+                )
+                new_key = f"{m['prefix']}{conversation_id}"
+                if user_suffix:
+                    # Preserve the per-user suffix so the re-keyed key
+                    # matches what the gateway will build post-enable.
+                    new_key = f"{new_key}:{user_suffix}"
+                if new_key in entries:
+                    # The conv-keyed session is the successor; the name-keyed
+                    # route is stale residue from a previous enable cycle.
+                    entries.pop(key, None)
+                    logger.info(
+                        "zulip legacy migration dropped stale route [key=%s]",
+                        mask_pii(key),
+                    )
+                    continue
+                moves.append((key, new_key, entry))
+            for old_key, new_key, entry in moves:
+                entries.pop(old_key, None)
+                entries[new_key] = _dc_replace(entry, session_key=new_key)
+            if moves:
+                save()
+        if moves:
+            logger.info(
+                "zulip legacy-session migration: rekeyed %d session(s)", len(moves)
+            )
+        return len(moves)
+
+    def _route_entries(self) -> dict:
+        """Live gateway routing entries keyed by ``session_key`` (public
+        ``SessionStore.list_sessions()``; empty on any failure)."""
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return {}
+        try:
+            entries = store.list_sessions() or []
+        except Exception as exc:
+            logger.debug("zulip store.list_sessions unavailable: %s", exc)
+            return {}
+        return {e.session_key: e for e in entries}
+
+    def _entry_for_conversation(self, entries: dict, conversation_id: str):
+        """The routing entry whose key tail is this conversation id."""
+        for key, entry in entries.items():
+            if key.rsplit(":", 1)[-1] == conversation_id:
+                return key, entry
+        return None, None
+
+    def _session_db(self):
+        """Gateway seam: ``SessionStore._db`` (the state-db handle, v0.21.5).
+
+        Used read-only for PAST gateway-session generations, which exist in
+        the sessions table but not in the routing index. Guarded: any shape
+        change degrades the listing/switch features gracefully (no counts,
+        live-session-only /continue) instead of raising.
+        """
+        store = getattr(self, "_session_store", None)
+        return getattr(store, "_db", None)
+
+    def _topic_sessions_command_reply(self, stream_id: int, topic: str) -> str:
+        """``/topic-sessions`` (topic sessions): list this topic's session set.
+
+        Read-only listing: the current session plus every former session,
+        each labeled with the topic where it was created. Bindings are
+        not changed; ``/continue <session-id>`` (R7) switches.
+        """
+
+        if self._conversations is None:
+            return (
+                "Topic sessions are disabled"
+                " (set ZULIP_TOPIC_SESSIONS=true to enable them)."
+            )
+        current_id, current_origin, members = self._conversations.sessions_for_topic(
+            stream_id, topic
+        )
+
+        entries = self._route_entries()
+        db = self._session_db()
+        store_missing = getattr(self, "_session_store", None) is None
+
+        def _lineage_sessions(conversation_id: str):
+            """All known gateway sessions of one lineage, newest first,
+            plus the currently-live id (None when the lineage has no live
+            routing entry). Users never see the lineage id itself — only
+            its gateway session ids, labeled with the lineage's origin."""
+            key, entry = self._entry_for_conversation(entries, conversation_id)
+            live = entry.session_id if entry is not None else None
+            ids = []
+            if db is not None and key is not None:
+                try:
+                    rows = db.list_sessions_rich(
+                        session_key=key, limit=50,
+                        order_by_last_active=True, include_hidden=True,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "zulip session enumeration unavailable [conv=%s]: %s",
+                        conversation_id, exc,
+                    )
+                    rows = []
+                for row in rows:
+                    sid = (row or {}).get("id") or (row or {}).get(
+                        "session_id")
+                    if sid and sid not in ids:
+                        ids.append(sid)
+            if live is not None and live not in ids:
+                ids.insert(0, live)
+            return live, ids
+
+        # Degraded mode (gateway store not wired): the gateway session ids
+        # cannot be known, so lines render without ids rather than falling
+        # back to lineage ids (which are plumbing, never user-facing).
+        lines = []
+        if store_missing:
+            # Degraded (gateway store not wired): the gateway session ids
+            # cannot be known, so lines render without ids rather than
+            # falling back to lineage ids (plumbing, never user-facing).
+            number = 0
+            if current_id is not None:
+                number += 1
+                lines.append(
+                    f"{number}) **(current)**"
+                    f' — started in "{current_origin}"'
+                )
+            for _member_id, member_origin in members:
+                number += 1
+                lines.append(f'{number}) — started in "{member_origin}"')
+            body = [f"📋 Sessions in this topic: {number}"]
+            if lines:
+                body += ["", *lines]
+            if number > 1:
+                body += [""]
+                body.append(
+                    "Use `/continue <session-id>` to switch to another"
+                    " session."
+                )
+            logger.debug(
+                "zulip /topic-sessions listing (degraded)"
+                " [channel=%s topic=%r count=%d]",
+                stream_id, mask_pii(topic), number,
+            )
+            return "\n".join(body)
+
+        lines = []
+        number = 0
+        for is_current, origin, conv in (
+            [(True, current_origin, current_id)] if current_id is not None else []
+        ) + [(False, origin, member_id) for member_id, origin in members]:
+            live, ids = _lineage_sessions(conv)
+            for position, sid in enumerate(ids):
+                number += 1
+                if is_current and sid == live:
+                    marker = " **(current)**"
+                elif not is_current and (
+                    sid == live or (position == 0 and live is None)
+                ):
+                    marker = " **(last)**"
+                else:
+                    marker = ""
+                lines.append(
+                    f'{number}) `{sid}`{marker} — started in "{origin}"'
+                )
+        body = [f"📋 Sessions in this topic: {number}"]
+        if lines:
+            body += ["", *lines]
+        if number > 1:
+            body += [""]
+            body.append(
+                "Use `/continue <session-id>` to switch to another session."
+            )
+        logger.debug(
+            "zulip /topic-sessions listing [channel=%s topic=%r count=%d]",
+            stream_id, mask_pii(topic), number,
+        )
+        return "\n".join(body)
+
+    def _continue_command_reply(
+        self, stream_id: int, topic: str, arg: str = ""
+    ) -> str:
+        """``/continue <gateway-session-id>`` (R7, inheritance-scoped).
+
+        Switches this topic to a gateway session from ITS OWN session
+        set — the lineages it created plus those handed to it by full
+        renames (merges) — as listed by ``/topic-sessions``. Only a
+        gateway session id is accepted (user ruling): lineage
+        (conversation) ids are grouping labels, not switch tokens.
+        Bare ``/continue`` does nothing: there is no implicit pick, and
+        a session held by another topic (or orphaned) can never be
+        named here, because its lineage is not part of this topic's set.
+        """
+        if self._conversations is None:
+            return (
+                "Topic sessions are disabled"
+                " (set ZULIP_TOPIC_SESSIONS=true to enable them)."
+            )
+        arg = (arg or "").strip()
+        if not arg:
+            return (
+                "Usage: `/continue <session-id>` — switch this topic to one"
+                " of its own gateway sessions (`YYYYMMDD_HHMMSS_hex`, as"
+                " listed by `/topic-sessions`). `/continue` alone does"
+                " nothing."
+            )
+        token = arg.split()[0]
+        if _GATEWAY_SESSION_ID_RE.fullmatch(token):
+            return self._continue_to_gateway_session(stream_id, topic, token)
+        return (
+            "That is not a session id shown by `/topic-sessions`."
+            " Nothing was changed."
+        )
+
+    def _continue_to_gateway_session(
+        self, stream_id: int, topic: str, session_id: str
+    ) -> str:
+        """/continue <gateway-session-id>: one-command switch.
+
+        Resolves the gateway session (live via the routing index, past
+        generations via the state-db seam), verifies its conversation
+        belongs to THIS topic's own set (R7 inheritance law — a session
+        held by another topic or orphaned is never reachable), re-binds
+        the topic when needed, and switches the gateway session — all in
+        one command.
+        """
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return (
+                "Session switching is unavailable (no session store wired)."
+                " Nothing was changed."
+            )
+
+        # 1. Resolve the session to its routing key / conversation.
+        key = None
+        entry = None
+        try:
+            entry = store.lookup_by_session_id(session_id)
+        except Exception as exc:
+            logger.debug("zulip lookup_by_session_id failed: %s", exc)
+        if entry is not None:
+            key = entry.session_key
+        else:
+            db = self._session_db()
+            if db is not None:
+                try:
+                    row = db.get_session(session_id)
+                except Exception as exc:
+                    logger.debug("zulip get_session failed: %s", exc)
+                    row = None
+                key = (row or {}).get("session_key")
+        if not key:
+            return (
+                f"No session `{session_id}` was found — use a session id"
+                " shown by `/topic-sessions`. Nothing was changed."
+            )
+        conversation_id = key.rsplit(":", 1)[-1]
+        if not _CONVERSATION_ID_RE.fullmatch(conversation_id):
+            return (
+                "That session is not part of this topic's sessions — use a"
+                " session id shown by `/topic-sessions`. Nothing was changed."
+            )
+
+        # 2. Inheritance verification (R7): the conversation must be part
+        # of this topic's own set.
+        current = self._conversations.lookup(stream_id, topic)
+        if current is None:
+            return "This topic has no session yet — nothing to continue."
+        if conversation_id == current and entry is not None:
+            return f"Already talking in session `{session_id}` here."
+        if conversation_id != current:
+            member_ids = {
+                member_id
+                for member_id, _origin in self._conversations.sessions_for_topic(
+                    stream_id, topic
+                )[2]
+            }
+            if conversation_id not in member_ids:
+                return (
+                    "That session is not one of this topic's sessions —"
+                    " use a session id shown by `/topic-sessions`."
+                    " Nothing was changed."
+                )
+            self._conversations.rebind(stream_id, topic, conversation_id)
+
+        # 3. Switch the gateway session under the lineage's key.
+        entries = self._route_entries()
+        expected = entries[key].session_id if key in entries else None
+        try:
+            switched = store.switch_session(
+                key, session_id, expected_session_id=expected
+            )
+        except Exception as exc:
+            logger.warning(
+                "zulip switch_session failed [key=%s target=%s]: %s",
+                mask_pii(key), session_id, exc,
+            )
+            switched = None
+        origin = self._conversations.sessions_for_topic(stream_id, topic)[1]
+        if switched is None:
+            if key not in self._route_entries():
+                return (
+                    "The topic binding moved, but the gateway has no live"
+                    " route for that lineage yet — send a message and it"
+                    " will start there."
+                )
+            return (
+                "That lineage moved while switching — please try"
+                " `/continue` again."
+            )
+        logger.debug(
+            "zulip gateway session switched via /continue"
+            " [channel=%s conv=%s session=%s topic=%r]",
+            stream_id, conversation_id, session_id, mask_pii(topic),
+        )
+        return (
+            f"🔗 This topic now talks in session `{session_id}`"
+            f', started in **{origin}**.'
+        )
+
+    async def _handle_message_delete_event(self, event: dict) -> None:
+        """R10 trigger: a ``delete_message`` event on a mapped topic.
+
+        ANY delete event on a mapped stream topic triggers a verification
+        — single-message deletes included, so a topic emptied message-by-
+        message (whatever the delete order, anchor first or last) is
+        detected by its final delete. The event itself cannot tell a
+        topic deletion from a partial one (partial bulk deletes exist —
+        deleting 2 of 9 messages is bulk but not a topic deletion), so
+        the channel's topic list (``get_stream_topics``) is the
+        authority: a topic exists while it has messages. Fail-open: on
+        any verification problem the mapping stays.
+        """
+        if self._conversations is None:
+            return
+        if event.get("message_type") != "stream":
+            return
+        stream_id = event.get("stream_id")
+        topic = event.get("topic", "")
+        if not isinstance(stream_id, int) or not topic:
+            return
+        if self._conversations.lookup(stream_id, topic) is None:
+            return
+        # Awaited inline so the spawned task (see the poll loop) covers the
+        # whole chain: trigger check -> topic-list verification -> orphaning.
+        await self._apply_topic_deletion(stream_id, topic)
+
+    async def _apply_topic_deletion(self, stream_id: int, topic: str) -> None:
+        """Verify a deletion trigger against the channel's topic list and,
+        only if the topic is really gone, orphan its session set (R10)."""
+        try:
+            result = await self._sdk_call(
+                self.client.get_stream_topics, stream_id, timeout=10.0
+            )
+        except Exception:
+            logger.exception(
+                "zulip topic-deletion verification failed; mapping kept"
+                " [channel=%s topic=%r]",
+                stream_id,
+                mask_pii(topic),
+            )
+            return
+        if not isinstance(result, dict) or result.get("result") != "success":
+            logger.warning(
+                "zulip topic-deletion verification unavailable; mapping kept"
+                " [channel=%s topic=%r]",
+                stream_id,
+                mask_pii(topic),
+            )
+            return
+        names = {str(t.get("name", "")) for t in (result.get("topics") or [])}
+        if topic in names:
+            logger.info(
+                "zulip delete event verified: topic still exists — ignored"
+                " [channel=%s topic=%r]",
+                stream_id,
+                mask_pii(topic),
+            )
+            return
+        orphaned = self._conversations.orphan_topic_sessions(stream_id, topic)
+        logger.info(
+            "zulip topic deleted — session set orphaned (no beneficiary)"
+            " [channel=%s topic=%r former=%d]",
+            stream_id,
+            mask_pii(topic),
+            orphaned,
+        )
+
     async def _handle_message(self, message: dict):
         """Process incoming Zulip message."""
+        message_id = message.get("id")
+        # Pop the conversation resolved at dispatch (if any) up front —
+        # before ANY early return, the self-message filter below included —
+        # so a pre-resolved self-message cannot leak a stash entry.
+        pre_resolved_conversation = (
+            self._pending_conversations.pop(str(message_id), None)
+            if message_id is not None
+            else None
+        )
+
         # Filter self-messages to prevent loops
         if message.get("sender_email") == self.email:
             return
 
         msg_type = message.get("type")  # "stream" or "private"
         content = message.get("content", "")
-        message_id = message.get("id")
         sender_email = message.get("sender_email", "")
         sender_full_name = message.get("sender_full_name", "Unknown")
 
@@ -1876,13 +2585,37 @@ class ZulipAdapter(BasePlatformAdapter):
                 cmd_chat_id = _private_chat_id(message)
                 cmd_topic = None
 
-            cmd_result = handle_command(
-                content=content,
-                chat_id=cmd_chat_id,
-                sender_email=sender_email,
-                sender_name=sender_full_name,
-                version=__version__,
+            # /continue and /topic-sessions (stable topic sessions): manual
+            # re-bind, and the read-only listing of this topic's sessions.
+            topic_cmd = (
+                content.strip().lower()
+                if self._conversations is not None and msg_type == "stream"
+                else ""
             )
+            if topic_cmd == "/continue" or topic_cmd.startswith("/continue "):
+                cmd_result = CommandResult(
+                    handled=True,
+                    reply=self._continue_command_reply(
+                        int(message.get("stream_id") or 0),
+                        cmd_topic or "",
+                        topic_cmd[len("/continue"):].strip(),
+                    ),
+                )
+            elif topic_cmd == "/topic-sessions":
+                cmd_result = CommandResult(
+                    handled=True,
+                    reply=self._topic_sessions_command_reply(
+                        int(message.get("stream_id") or 0), cmd_topic or ""
+                    ),
+                )
+            else:
+                cmd_result = handle_command(
+                    content=content,
+                    chat_id=cmd_chat_id,
+                    sender_email=sender_email,
+                    sender_name=sender_full_name,
+                    version=__version__,
+                )
             if cmd_result.handled:
                 # Send command reply directly
                 try:
@@ -1971,8 +2704,24 @@ class ZulipAdapter(BasePlatformAdapter):
                 "user_id": sender_email,
                 "user_name": sender_full_name,
             }
-            if topic and _topic_sessions_enabled():
-                source_kwargs["thread_id"] = topic
+            if topic and self._conversations is not None:
+                # Sessions key on a rename-proof conversation id — never the
+                # topic name. Renames must not strand or fabricate sessions;
+                # /new is the only way to start a fresh session in a topic.
+                if isinstance(stream_id, int):
+                    if pre_resolved_conversation is not None:
+                        # Resolved at dispatch, in event-id order (F1) — a
+                        # rename processed since then must not fork this
+                        # message onto a fresh conversation.
+                        source_kwargs["thread_id"] = pre_resolved_conversation
+                    else:
+                        source_kwargs["thread_id"] = self._conversations.resolve(
+                            stream_id,
+                            topic,
+                            anchor_message_id=int(message_id) if message_id else None,
+                        )
+                # Malformed stream_id: no thread_id → degrades to the
+                # per-stream session (unreachable for well-formed events).
             source = self.build_source(**source_kwargs)
             extra_meta = {"topic": topic, "stream_id": stream_id}
         else:
@@ -2472,9 +3221,10 @@ class ZulipAdapter(BasePlatformAdapter):
             base: dict[str, Any] = {"type": "private", "to": target["user_ids"]}
         else:
             # prompt.metadata carries the turn's routing metadata (thread_id =
-            # the session's topic) from the runner; the cache is only a fallback.
-            topic = _metadata_topic(prompt.metadata) or self._topic_cache.get(
-                prompt.chat_id, "general"
+            # a conversation id with stable topic sessions, else the topic
+            # name); the cache is only a fallback.
+            topic = self._routed_topic(target["stream_id"], prompt.metadata) or (
+                self._topic_cache.get(prompt.chat_id, "general")
             )
             base = {"type": "stream", "to": target["stream_id"], "topic": topic}
 
@@ -2682,7 +3432,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
             else:
                 stream_id = target["stream_id"]
-                topic = topic_override or _metadata_topic(metadata)
+                topic = topic_override or self._routed_topic(stream_id, metadata)
                 if not topic:
                     topic = self._topic_cache.get(chat_id, "general")
 
