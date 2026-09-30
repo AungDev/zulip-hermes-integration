@@ -574,7 +574,7 @@ class TestContinueCommand:
         )
         cmd_call = adapter.client._client._sent_messages[0]
         assert "Usage:" in cmd_call["content"]
-        assert "/continue <session-id>" in cmd_call["content"]
+        assert "/continue <id>" in cmd_call["content"]
         # Registry untouched: the topic still holds its own session.
         assert adapter._conversations.lookup(7, "deploys") == conv
 
@@ -741,6 +741,171 @@ class TestContinueCommand:
         # no 9-char (exactly-9-between-backticks) short tokens anywhere
         assert not re.findall(r"`c[0-9a-f]{9}`", reply)
 
+
+    @pytest.mark.asyncio
+    async def test_sessions_listing_shows_live_session_and_generations(
+        self, adapter
+    ):
+        """P1: each lineage line carries its live gateway session id and
+        generation count (from the state-db seam)."""
+        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
+        await adapter._handle_message(_stream_msg("Fix XY", msg_id=2))
+        adapter._handle_topic_update(_rename_event("Fix XY", "Deploy XY"))
+        current, _origin, members = adapter._conversations.sessions_for_topic(
+            7, "Deploy XY"
+        )
+        convs = [current] + [m[0] for m in members]
+        keys = {
+            conv: f"agent:main:zulip:stream:7:{conv}" for conv in convs
+        }
+        sessions_by_key = {
+            keys[convs[0]]: [{"id": "20260930_131224_031f7ae1"},
+                              {"id": "20260928_180207_789321ca"}],
+            keys[convs[1]]: [{"id": "20260930_131553_13d2b944"}],
+        }
+        store = _FakeSessionStore(
+            entries={
+                keys[convs[0]]: _FakeRouteEntry(
+                    keys[convs[0]], "20260930_131224_031f7ae1"),
+                keys[convs[1]]: _FakeRouteEntry(
+                    keys[convs[1]], "20260930_131553_13d2b944"),
+            },
+            db=_FakeSessionDB(sessions_by_key=sessions_by_key),
+        )
+        adapter.set_session_store(store)
+        await adapter._handle_message(
+            _stream_msg("Deploy XY", msg_id=3, content="/topic-sessions")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        assert "live session `20260930_131224_031f7ae1`" in reply
+        assert "2 generations" in reply
+        assert "live session `20260930_131553_13d2b944`" in reply
+        assert "1 generations" in reply  # singular is fine for a pin
+
+    @pytest.mark.asyncio
+    async def test_sessions_listing_degrades_without_store(self, adapter):
+        """No session store wired: the listing still renders (ids + origins),
+        without live-session annotations."""
+        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
+        await adapter._handle_message(
+            _stream_msg("Deploy XY", msg_id=2, content="/topic-sessions")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        assert "(current)" in reply
+        assert "live session" not in reply
+
+    @pytest.mark.asyncio
+    async def test_continue_gateway_session_id_switches_in_one_command(
+        self, adapter
+    ):
+        """P2: /continue <gateway-session-id> verifies inheritance, rebinds
+        and switches the gateway session in one command — even for a PAST
+        generation that is not the lineage's live one."""
+        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
+        conv_deploy = adapter._conversations.lookup(7, "Deploy XY")
+        await adapter._handle_message(_stream_msg("Fix XY", msg_id=2))
+        conv_fix = adapter._conversations.lookup(7, "Fix XY")
+        adapter._handle_topic_update(_rename_event("Fix XY", "Deploy XY"))
+        # current is now Fix XY's conv; Deploy XY's conv is a former member.
+
+        # The TARGET is a PAST generation of the DISPLACED (Deploy XY)
+        # lineage — not its live one — so both the rebind and the switch
+        # are genuinely exercised.
+        dead_gen = "20260928_180207_789321ca"
+        deploy_key = f"agent:main:zulip:stream:7:{conv_deploy}"
+        store = _FakeSessionStore(
+            entries={
+                deploy_key: _FakeRouteEntry(
+                    deploy_key, "20260930_131553_13d2b944"),
+            },
+            db=_FakeSessionDB(rows_by_id={
+                dead_gen: {"session_id": dead_gen, "session_key": deploy_key},
+            }),
+        )
+        adapter.set_session_store(store)
+
+        await adapter._handle_message(
+            _stream_msg("Deploy XY", msg_id=3,
+                        content=f"/continue {dead_gen}")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        # the topic was rebound to the Deploy XY lineage (a former member)
+        assert adapter._conversations.lookup(7, "Deploy XY") == conv_deploy
+        # and the gateway session was switched to the requested generation
+        assert (deploy_key, dead_gen, "20260930_131553_13d2b944") in store.switch_calls
+        assert f"talks in session `{dead_gen}`" in reply
+        assert f"lineage `{conv_deploy}`" in reply
+
+    @pytest.mark.asyncio
+    async def test_continue_gateway_session_id_rejects_foreign_lineage(
+        self, adapter
+    ):
+        """R7 law holds for session ids: a session whose conversation is not
+        in this topic's set is never switchable."""
+        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
+        await adapter._handle_message(_stream_msg("Other Topic", msg_id=2))
+        foreign_conv = adapter._conversations.lookup(7, "Other Topic")
+        foreign_key = f"agent:main:zulip:stream:7:{foreign_conv}"
+        store = _FakeSessionStore(
+            entries={foreign_key: _FakeRouteEntry(foreign_key, "20260928_180039_ac06c9b7")},
+            db=_FakeSessionDB(rows_by_id={
+                "20260928_180039_ac06c9b7": {
+                    "session_id": "20260928_180039_ac06c9b7",
+                    "session_key": foreign_key},
+            }),
+        )
+        adapter.set_session_store(store)
+        await adapter._handle_message(
+            _stream_msg("Deploy XY", msg_id=3,
+                        content="/continue 20260928_180039_ac06c9b7")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        assert "not part of this topic's session set" in reply
+        assert store.switch_calls == []
+        # binding untouched
+        assert adapter._conversations.lookup(7, "Deploy XY") != foreign_conv
+
+    @pytest.mark.asyncio
+    async def test_continue_unknown_gateway_session_id_changes_nothing(
+        self, adapter
+    ):
+        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
+        store = _FakeSessionStore(entries={}, db=_FakeSessionDB())
+        adapter.set_session_store(store)
+        await adapter._handle_message(
+            _stream_msg("Deploy XY", msg_id=2,
+                        content="/continue 20260928_180207_789321ca")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        assert "No gateway session" in reply
+        assert store.switch_calls == []
+        assert adapter._conversations.lookup(7, "Deploy XY") is not None
+
+    @pytest.mark.asyncio
+    async def test_continue_live_gateway_session_id_via_routing_index(
+        self, adapter
+    ):
+        """A LIVE generation resolves through the public routing index even
+        when the state-db seam is unavailable."""
+        await adapter._handle_message(_stream_msg("Deploy XY", msg_id=1))
+        conv_current = adapter._conversations.lookup(7, "Deploy XY")
+        await adapter._handle_message(_stream_msg("Fix XY", msg_id=2))
+        conv_fix = adapter._conversations.lookup(7, "Fix XY")
+        adapter._handle_topic_update(_rename_event("Fix XY", "Deploy XY"))
+        fix_key = f"agent:main:zulip:stream:7:{conv_fix}"
+        store = _FakeSessionStore(
+            entries={fix_key: _FakeRouteEntry(fix_key, "20260930_131224_031f7ae1")},
+        )
+        adapter.set_session_store(store)
+        await adapter._handle_message(
+            _stream_msg("Deploy XY", msg_id=3,
+                        content="/continue 20260930_131224_031f7ae1")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        assert adapter._conversations.lookup(7, "Deploy XY") == conv_fix
+        assert (fix_key, "20260930_131224_031f7ae1", "20260930_131224_031f7ae1") in store.switch_calls
+        assert f"lineage `{conv_fix}`" in reply
+
     @pytest.mark.asyncio
     async def test_sessions_passthrough_when_disabled(
         self, mock_platform_config, monkeypatch, tmp_path
@@ -802,13 +967,54 @@ class _FakeSessionStore:
     ``_entries`` dict, ``_lock``, ``_save()`` (same shape the store's own
     ``rekey_profile_routing`` uses)."""
 
-    def __init__(self, entries=None):
+    def __init__(self, entries=None, db=None):
         self._entries = dict(entries or {})
         self._lock = threading.Lock()
         self.save_calls = 0
+        self.switch_calls = []
+        self._db = db
 
     def _save(self):
         self.save_calls += 1
+
+    # --- surface used by /topic-sessions (P1) and /continue (P2) ---
+    def list_sessions(self, active_minutes=None):
+        return list(self._entries.values())
+
+    def peek_session_id(self, session_key):
+        entry = self._entries.get(session_key)
+        return entry.session_id if entry else None
+
+    def lookup_by_session_id(self, session_id):
+        for entry in self._entries.values():
+            if entry.session_id == session_id:
+                return entry
+        return None
+
+    def switch_session(self, session_key, target_session_id, *, expected_session_id=None):
+        self.switch_calls.append((session_key, target_session_id, expected_session_id))
+        entry = self._entries.get(session_key)
+        if entry is None:
+            return None
+        if expected_session_id is not None and entry.session_id != expected_session_id:
+            return None
+        entry.session_id = target_session_id
+        return entry
+
+
+class _FakeSessionDB:
+    """Stand-in for the state-db handle (SessionStore._db seam)."""
+
+    def __init__(self, sessions_by_key=None, rows_by_id=None):
+        # sessions_by_key: key -> list of row dicts (generations)
+        self.sessions_by_key = dict(sessions_by_key or {})
+        self.rows_by_id = dict(rows_by_id or {})
+
+    def list_sessions_rich(self, **kwargs):
+        return list(self.sessions_by_key.get(kwargs.get("session_key"), []))
+
+    def get_session(self, session_id):
+        return self.rows_by_id.get(session_id)
 
 
 class TestLegacySessionMigration:

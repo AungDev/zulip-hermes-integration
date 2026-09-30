@@ -486,6 +486,8 @@ _LEGACY_ZULIP_STREAM_KEY = re.compile(
 # Conversation ids minted by the registry ("c" + 12 hex chars) — used to
 # recognize already-migrated (conv-keyed) session keys.
 _CONVERSATION_ID_RE = re.compile(r"^c[0-9a-f]{12}$")
+# Gateway session ids: <YYYYMMDD>_<HHMMSS>_<hex> (e.g. 20260928_180207_789321ca).
+_GATEWAY_SESSION_ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]+$")
 
 
 def _split_session_key_tail(tail: str) -> tuple[str, Optional[str]]:
@@ -1329,6 +1331,37 @@ class ZulipAdapter(BasePlatformAdapter):
             )
         return len(moves)
 
+    def _route_entries(self) -> dict:
+        """Live gateway routing entries keyed by ``session_key`` (public
+        ``SessionStore.list_sessions()``; empty on any failure)."""
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return {}
+        try:
+            entries = store.list_sessions() or []
+        except Exception as exc:
+            logger.debug("zulip store.list_sessions unavailable: %s", exc)
+            return {}
+        return {e.session_key: e for e in entries}
+
+    def _entry_for_conversation(self, entries: dict, conversation_id: str):
+        """The routing entry whose key tail is this conversation id."""
+        for key, entry in entries.items():
+            if key.rsplit(":", 1)[-1] == conversation_id:
+                return key, entry
+        return None, None
+
+    def _session_db(self):
+        """Gateway seam: ``SessionStore._db`` (the state-db handle, v0.21.5).
+
+        Used read-only for PAST gateway-session generations, which exist in
+        the sessions table but not in the routing index. Guarded: any shape
+        change degrades the listing/switch features gracefully (no counts,
+        live-session-only /continue) instead of raising.
+        """
+        store = getattr(self, "_session_store", None)
+        return getattr(store, "_db", None)
+
     def _topic_sessions_command_reply(self, stream_id: int, topic: str) -> str:
         """``/topic-sessions`` (topic sessions): list this topic's session set.
 
@@ -1347,19 +1380,46 @@ class ZulipAdapter(BasePlatformAdapter):
         )
         total = len(members) + (1 if current_id is not None else 0)
 
+        entries = self._route_entries()
+        db = self._session_db()
+
+        def _gateway_bits(conversation_id: str) -> str:
+            """Live session id + generation count for one lineage (best effort)."""
+            key, entry = self._entry_for_conversation(entries, conversation_id)
+            if entry is None:
+                return ""
+            parts = [f"live session `{entry.session_id}`"]
+            if db is not None:
+                try:
+                    rows = db.list_sessions_rich(
+                        session_key=key, limit=50, include_hidden=True
+                    )
+                    if rows:
+                        parts.append(f"{len(rows)} generations")
+                except Exception as exc:
+                    logger.debug(
+                        "zulip generation count unavailable [conv=%s]: %s",
+                        conversation_id, exc,
+                    )
+            return " — " + " · ".join(parts)
+
         lines = [f"📋 Sessions for this topic: {total}", ""]
         if current_id is not None:
             lines.append(
                 f"▸ `{current_id}` **(current)**"
                 f' — started in "{current_origin}"'
+                f"{_gateway_bits(current_id)}"
             )
         for member_id, member_origin in members:
-            lines.append(f'◦ `{member_id}` — started in "{member_origin}"')
+            lines.append(
+                f'◦ `{member_id}` — started in "{member_origin}"'
+                f"{_gateway_bits(member_id)}"
+            )
         if members:
             lines.append("")
             lines.append(
-                "`/continue <session-id>` switches to a former session"
-                " (use the full id as listed above)."
+                "`/continue <id>` switches to a former session — use either"
+                " the conversation id or any listed gateway session id."
             )
         logger.debug(
             "zulip /topic-sessions listing [channel=%s topic=%r count=%d]",
@@ -1387,15 +1447,21 @@ class ZulipAdapter(BasePlatformAdapter):
         arg = (arg or "").strip()
         if not arg:
             return (
-                "Usage: `/continue <session-id>` — re-bind this topic to one"
-                " of its own former sessions (ids via `/topic-sessions`)."
-                " `/continue` alone does nothing."
+                "Usage: `/continue <id>` — switch this topic to one of its own"
+                " sessions. `<id>` is either a conversation id (`c` + 12 hex)"
+                " or a gateway session id (`YYYYMMDD_HHMMSS_hex`), as listed by"
+                " `/topic-sessions`. `/continue` alone does nothing."
             )
-        conversation_id = arg.split()[0]
+        token = arg.split()[0]
+        if _GATEWAY_SESSION_ID_RE.fullmatch(token):
+            return self._continue_to_gateway_session(stream_id, topic, token)
+        conversation_id = token
         if not _CONVERSATION_ID_RE.fullmatch(conversation_id):
             return (
-                "That is not a session id (expected `c` + 12 hex characters,"
-                " as shown by `/topic-sessions`). Nothing was changed."
+                "That is not a session id (expected a conversation id —"
+                " `c` + 12 hex — or a gateway session id —"
+                " `YYYYMMDD_HHMMSS_hex`, as shown by `/topic-sessions`)."
+                " Nothing was changed."
             )
         current = self._conversations.lookup(stream_id, topic)
         if current is None:
@@ -1426,6 +1492,111 @@ class ZulipAdapter(BasePlatformAdapter):
             f"🔗 This topic now continues session `{conversation_id}`"
             f" (started in **{origin}**). The previous session stays here"
             f" as a former session — `/continue {previous}` switches back."
+        )
+
+    def _continue_to_gateway_session(
+        self, stream_id: int, topic: str, session_id: str
+    ) -> str:
+        """/continue <gateway-session-id>: one-command switch.
+
+        Resolves the gateway session (live via the routing index, past
+        generations via the state-db seam), verifies its conversation
+        belongs to THIS topic's own set (R7 inheritance law — a session
+        held by another topic or orphaned is never reachable), re-binds
+        the topic when needed, and switches the gateway session — all in
+        one command.
+        """
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return (
+                "Session switching is unavailable (no session store wired)."
+                " Nothing was changed."
+            )
+
+        # 1. Resolve the session to its routing key / conversation.
+        key = None
+        entry = None
+        try:
+            entry = store.lookup_by_session_id(session_id)
+        except Exception as exc:
+            logger.debug("zulip lookup_by_session_id failed: %s", exc)
+        if entry is not None:
+            key = entry.session_key
+        else:
+            db = self._session_db()
+            if db is not None:
+                try:
+                    row = db.get_session(session_id)
+                except Exception as exc:
+                    logger.debug("zulip get_session failed: %s", exc)
+                    row = None
+                key = (row or {}).get("session_key")
+        if not key:
+            return (
+                f"No gateway session `{session_id}` was found (live or past)."
+                " Nothing was changed."
+            )
+        conversation_id = key.rsplit(":", 1)[-1]
+        if not _CONVERSATION_ID_RE.fullmatch(conversation_id):
+            return (
+                "That session does not belong to a topic-session lineage"
+                " (it is a DM or another scope). Nothing was changed."
+            )
+
+        # 2. Inheritance verification (R7): the conversation must be part
+        # of this topic's own set.
+        current = self._conversations.lookup(stream_id, topic)
+        if current is None:
+            return "This topic has no session yet — nothing to continue."
+        if conversation_id != current:
+            member_ids = {
+                member_id
+                for member_id, _origin in self._conversations.sessions_for_topic(
+                    stream_id, topic
+                )[2]
+            }
+            if conversation_id not in member_ids:
+                return (
+                    "That session is not part of this topic's session set"
+                    " (own + inherited) — a session held by another topic or"
+                    " orphaned cannot be continued. Nothing was changed."
+                    " See `/topic-sessions`."
+                )
+            self._conversations.rebind(stream_id, topic, conversation_id)
+
+        # 3. Switch the gateway session under the lineage's key.
+        entries = self._route_entries()
+        expected = entries[key].session_id if key in entries else None
+        try:
+            switched = store.switch_session(
+                key, session_id, expected_session_id=expected
+            )
+        except Exception as exc:
+            logger.warning(
+                "zulip switch_session failed [key=%s target=%s]: %s",
+                mask_pii(key), session_id, exc,
+            )
+            switched = None
+        origin = self._conversations.sessions_for_topic(stream_id, topic)[1]
+        if switched is None:
+            if key not in self._route_entries():
+                return (
+                    "The topic binding moved, but the gateway has no live"
+                    " route for that lineage yet — send a message and it"
+                    " will start there."
+                )
+            return (
+                "That lineage moved while switching — please try"
+                " `/continue` again."
+            )
+        logger.debug(
+            "zulip gateway session switched via /continue"
+            " [channel=%s conv=%s session=%s topic=%r]",
+            stream_id, conversation_id, session_id, mask_pii(topic),
+        )
+        return (
+            f"🔗 This topic now talks in session `{session_id}`"
+            f" (lineage `{conversation_id}`, started in **{origin}**)."
         )
 
     async def _handle_message_delete_event(self, event: dict) -> None:
