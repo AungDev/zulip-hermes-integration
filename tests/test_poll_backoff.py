@@ -122,7 +122,12 @@ class TestRegisterQueueBudget:
         adapter._register_queue()
         kwargs = adapter.client.register.call_args.kwargs
         assert kwargs["fetch_event_types"] == ["realm"]
-        assert kwargs["event_types"] == ["message"]
+        # Stable topic sessions require the full subscription (rename and
+        # deletion events) — a bare ["message"] would re-trigger the stale
+        # queue-subscription bug the queue manager guards against.
+        assert kwargs["event_types"] == [
+            "message", "update_message", "delete_message",
+        ]
         assert kwargs["fetch_event_id"] == 0
 
     def test_abort_budget_is_raised_above_the_servers_budget(self, adapter):

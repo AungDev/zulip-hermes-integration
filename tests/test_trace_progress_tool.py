@@ -63,6 +63,11 @@ def stream_event(topic="api-review", chat_id="573423"):
 
 
 async def _settle():
+    # The trace post/edit goes through asyncio.to_thread — a real executor
+    # hop. A fixed number of loop cycles races the thread pool and flakes
+    # under load (the step is then dropped, by design, before the trace has
+    # a message id). Wait a real slice so the executor callback always lands.
+    await asyncio.sleep(0.05)
     for _ in range(5):
         await asyncio.sleep(0)
 

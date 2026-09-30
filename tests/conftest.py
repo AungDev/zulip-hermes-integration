@@ -111,6 +111,20 @@ def clear_caches():
     yield
 
 
+
+@pytest.fixture(autouse=True)
+def _clear_live_adapters_registry():
+    """Adapters self-register in a module-level WeakSet (tool-step
+    attribution, activity traces). A host context can outlive its test and
+    keep a stale adapter alive, whose session context then matches the NEXT
+    test and consumes its step. Clearing the registry between tests keeps
+    attribution deterministic regardless of test order."""
+    yield
+    import zulip.adapter as _adapter_module
+    live = getattr(_adapter_module, "_LIVE_ADAPTERS", None)
+    if live is not None:
+        live.clear()
+
 @pytest.fixture
 def mock_zulip_client():
     return MockZulipClient()

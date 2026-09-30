@@ -72,7 +72,12 @@ def dm_event(chat_id="dm:42"):
 
 
 async def _settle():
-    """Let the background trace-start task run."""
+    """Let the background trace-start task run.
+
+    The trace post goes through asyncio.to_thread — a real executor hop. A
+    fixed number of loop cycles races the thread pool and flakes under load;
+    wait a real slice so the executor callback always lands."""
+    await asyncio.sleep(0.05)
     for _ in range(5):
         await asyncio.sleep(0)
 

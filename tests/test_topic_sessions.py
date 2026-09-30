@@ -25,6 +25,23 @@ class TestTopicSessionsFlag:
 
 class TestTopicScoping:
     @pytest.fixture
+    def adapter(self, mock_platform_config, monkeypatch):
+        import zulip.adapter as adapter_module
+        monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
+
+        class MockZulipModule:
+            class Client:
+                def __init__(self, email=None, api_key=None, site=None):
+                    pass
+
+        monkeypatch.setattr(adapter_module, "zulip", MockZulipModule())
+        from zulip.adapter import ZulipAdapter
+        a = ZulipAdapter(mock_platform_config)
+        a.email = "bot@zulip.com"
+        a.handle_message = AsyncMock()
+        return a
+
+    @pytest.fixture
     def make_adapter(self, mock_platform_config, monkeypatch, tmp_path):
         """Adapter factory — the registry is built at construction time, so
         ZULIP_TOPIC_SESSIONS must be set before ZulipAdapter() is created."""
