@@ -12,6 +12,7 @@ import os
 import re
 import tempfile
 import time
+import weakref
 from dataclasses import replace as _dc_replace
 from collections import OrderedDict
 from pathlib import Path
@@ -33,6 +34,16 @@ try:
     from gateway.platforms.base import ExecApprovalPrompt
 except ImportError:  # pragma: no cover - gateways < 0.21.3
     ExecApprovalPrompt = Any  # type: ignore[assignment,misc]
+
+# Processing lifecycle hooks (on_processing_start / on_processing_complete) and
+# their outcome enum first shipped alongside ExecApprovalPrompt. Guarded for the
+# same reason: on an older gateway the hooks are simply never called, so the
+# activity trace does not run — rather than the whole plugin failing to import.
+# (epic #139 / issue #158)
+try:
+    from gateway.platforms.base import ProcessingOutcome
+except ImportError:  # pragma: no cover - gateways without lifecycle hooks
+    ProcessingOutcome = None  # type: ignore[assignment,misc]
 
 from gateway.config import Platform, PlatformConfig
 
@@ -58,10 +69,82 @@ from .commands import CommandResult, handle_command, is_command
 from .conversations import TopicConversationRegistry
 from .policy import PolicyEngine
 from . import updater
-from .probe import probe_zulip, _normalize_base_url
+from .probe import (
+    INSECURE_HTTP_ENV,
+    base_url_error,
+    probe_zulip,
+    _normalize_base_url,
+)
 from .recovery import recover_interrupted_messages
 from .rate_limiter import RateLimiter
 from .audit_logger import AuditLogger
+from .activity_trace import ActivityTrace, TraceConfig
+
+# Per-task session context published by the gateway (epic #139 / #159). Guarded
+# like every other host symbol: on a gateway without it, tool steps simply
+# cannot be attributed and are dropped rather than guessed at.
+try:
+    from gateway.session_context import get_session_env as _host_get_session_env
+except ImportError:  # pragma: no cover - gateways without session context
+    _host_get_session_env = None  # type: ignore[assignment]
+
+# Live adapters, so the plugin-level ``post_tool_call`` callback — registered in
+# ``register(ctx)``, before any adapter exists — can find the one whose trace
+# owns the current work item.
+_LIVE_ADAPTERS: "weakref.WeakSet[Any]" = weakref.WeakSet()
+
+
+def _on_post_tool_call(**kwargs: Any) -> None:
+    """Observer for finished tool calls (epic #139 / #159).
+
+    Deliberately **synchronous**: the host dispatches this hook through the sync
+    ``invoke_hook``, so an ``async def`` here would return a coroutine nobody
+    awaits and silently do nothing. It only records state — the trace's own
+    coalesced flush performs the I/O.
+    """
+    for adapter in list(_LIVE_ADAPTERS):
+        try:
+            adapter.record_tool_step(**kwargs)
+        except Exception:
+            # A trace must never interfere with the agent's tool call.
+            continue
+
+
+def _zulip_progress_handler(args: Any) -> str:
+    """``zulip_progress`` tool handler — agent-authored trace steps (#160).
+
+    Synchronous: the tool registry calls the handler directly and this only
+    records state (the trace's own coalesced flush does the I/O). Returns a
+    short acknowledgement so the model sees a result either way — a run without
+    an active trace must not look like a failure.
+    """
+    note = ""
+    if isinstance(args, dict):
+        for field in ("note", "step", "message"):
+            candidate = args.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                note = candidate.strip()
+                break
+    if not note:
+        return "error: zulip_progress requires a non-empty 'note'"
+
+    shown = False
+    for adapter in list(_LIVE_ADAPTERS):
+        try:
+            if adapter.record_progress_step(note):
+                shown = True
+        except Exception:
+            continue
+    if shown:
+        return "noted"
+    return "no activity trace is active for this conversation; note not shown"
+from .secret_guard import (
+    KnownSecret,
+    block_secret_leaks_enabled,
+    collect_known_secrets,
+    describe_leaked_secrets,
+    find_leaked_secrets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +236,8 @@ def _get_cached_client(site: str, email: str, api_key: str, *, _zulip_mod: Any =
 def _get_cached_target(chat_id: str) -> dict[str, Any] | None:
     """Return cached target info or None.
 
-    Target info: {"type": "dm", "user_id": int} | {"type": "stream", "stream_id": int}
+    Target info: {"type": "dm", "user_ids": list[int]} |
+    {"type": "stream", "stream_id": int}
     """
     info = _target_cache.get(chat_id)
     if info is not None:
@@ -183,15 +267,68 @@ def _parse_target(chat_id: str) -> dict[str, Any]:
 
     if chat_id.startswith("dm:"):
         # Session-scoped DM chat_ids include a `:session:N` suffix (e.g.
-        # `dm:1032616:session:1`). Strip everything after the user id so
-        # the send path resolves the correct target. (Issue #111)
-        user_part = chat_id[3:].split(":", 1)[0]
-        info = {"type": "dm", "user_id": int(user_part)}
+        # `dm:1032616:session:1`). Strip everything after the recipient list
+        # so the send path resolves the correct target. (Issue #111)
+        #
+        # A group DM carries every recipient, comma-separated
+        # (`dm:7,42,99`). Replying with only the sender would start a new
+        # one-to-one DM instead of continuing the group conversation, so the
+        # complete set is part of the address. (Issue #154)
+        recipients = chat_id[3:].split(":", 1)[0]
+        user_ids = [int(part) for part in recipients.split(",") if part.strip()]
+        if not user_ids:
+            raise ValueError("DM target must include at least one recipient")
+        info = {"type": "dm", "user_ids": user_ids}
     else:
         info = {"type": "stream", "stream_id": int(chat_id)}
 
     _set_cached_target(chat_id, info)
     return info
+
+
+def _private_recipient_ids(message: dict[str, Any]) -> list[int]:
+    """Return every recipient of an incoming private message, sorted.
+
+    Zulip represents a direct message's ``display_recipient`` as the list of
+    participants, the bot included. A one-to-one DM therefore has two entries
+    and a group DM has more. Preserving the complete set is what keeps a reply
+    inside the original conversation instead of starting a new one-to-one DM
+    with just the sender. (Issue #154)
+
+    Older or malformed events may omit the recipient list, so fall back to the
+    sender's id. That reproduces the previous behaviour for one-to-one DMs.
+    """
+    recipient_ids: set[int] = set()
+
+    recipients = message.get("display_recipient")
+    if isinstance(recipients, list):
+        for recipient in recipients:
+            if not isinstance(recipient, dict):
+                continue
+            try:
+                recipient_ids.add(int(recipient["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    if not recipient_ids:
+        try:
+            recipient_ids.add(int(message["sender_id"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    return sorted(recipient_ids)
+
+
+def _private_chat_id(message: dict[str, Any]) -> str:
+    """Encode a private message's recipient set as the adapter chat id.
+
+    The address has to be self-describing: replies are routed by chat id, so
+    the recipient set must survive persistence and a gateway restart.
+    """
+    recipient_ids = _private_recipient_ids(message)
+    if not recipient_ids:
+        raise ValueError("Private message has no usable recipient IDs")
+    return "dm:" + ",".join(str(user_id) for user_id in recipient_ids)
 
 
 def _clear_caches() -> None:
@@ -263,6 +400,24 @@ DEFAULT_CONNECT_TIMEOUT = 30.0
 DEFAULT_READ_TIMEOUT = 60.0
 DEFAULT_SEND_TIMEOUT = 90.0
 
+# --- Event polling (Issue #146) ---
+#
+# A /events long-poll that returns faster than this did not hold the poll, so
+# the server is answering immediately and re-polling at full speed would spin
+# (and, on the constrained hosts this runs on, fill the log with poll noise).
+# A response at or above it was really held, meaning the server is pacing us,
+# so it must gain no added delay.
+POLL_FAST_RETURN_SECONDS = 2.5
+POLL_BACKOFF_START = 1.0
+POLL_BACKOFF_MAX = 5.0
+# Zulip documents ``event_queue_longpoll_timeout_seconds`` as 1-90s, and only
+# returns the field when /register asks for ``fetch_event_types: ["realm"]``.
+LONGPOLL_MIN_SECONDS = 1.0
+LONGPOLL_MAX_SECONDS = 90.0
+# Headroom over the server's own budget, so our client-side abort can never
+# pre-empt a healthy long-poll.
+LONGPOLL_GRACE_SECONDS = 10.0
+
 
 def _resolve_chunk_config() -> tuple[int, str]:
     """Read chunking config from environment."""
@@ -289,6 +444,35 @@ def _resolve_timeouts() -> tuple[float, float, float]:
     read = _parse(os.getenv("ZULIP_READ_TIMEOUT", ""), DEFAULT_READ_TIMEOUT)
     send = _parse(os.getenv("ZULIP_SEND_TIMEOUT", ""), DEFAULT_SEND_TIMEOUT)
     return connect, read, send
+
+
+def _clamp_longpoll_budget(value: Any) -> Optional[float]:
+    """Clamp a server long-poll budget to Zulip's documented 1-90s window.
+
+    Returns ``None`` when the value is missing or unusable, which leaves the
+    caller's configured timeout in place rather than guessing. (Issue #146)
+    """
+    try:
+        budget = float(value)
+    except (TypeError, ValueError):
+        return None
+    if budget <= 0:
+        return None
+    return min(max(budget, LONGPOLL_MIN_SECONDS), LONGPOLL_MAX_SECONDS)
+
+
+def _next_poll_backoff(elapsed: float, had_message: bool, current: float) -> float:
+    """Return the delay before the next /events poll (0.0 = poll at once).
+
+    Latency-gated (Issue #146): the question is not "were there events?" but
+    "did the server hold the long-poll?". A poll that came back quickly did
+    not, so the loop has to insert its own delay or it will spin as fast as
+    the API answers; a poll that was genuinely held is already paced by the
+    server and must not gain any latency.
+    """
+    if had_message or elapsed >= POLL_FAST_RETURN_SECONDS:
+        return 0.0
+    return min(max(current * 2, POLL_BACKOFF_START), POLL_BACKOFF_MAX)
 
 
 def _resolve_streams_filter() -> set[str] | None:
@@ -560,16 +744,32 @@ class ZulipAdapter(BasePlatformAdapter):
         self.api_key = os.getenv("ZULIP_API_KEY") or extra.get("api_key", "")
         self.email = os.getenv("ZULIP_EMAIL") or extra.get("email", "")
         self.site = os.getenv("ZULIP_SITE") or extra.get("site", "")
+
+        # Outbound secret guard (Issue #136): the platform extra is walked for
+        # credential-shaped keys, and the adapter's own api_key is registered
+        # explicitly — those are exactly the values a prompt-injected agent
+        # would paste into the room.
+        self._platform_extra = extra
+        self._known_secrets_cache: Optional[list[KnownSecret]] = None
         # Populated on connect. Zulip renders mentions from the display name,
         # not the email local-part, so mention matching needs it.
         self.bot_full_name = ""
 
-        # Validate site URL to prevent SSRF before creating client
+        # Validate site URL before creating client: https-only unless the
+        # operator opted in, so the API key cannot leave in cleartext by
+        # accident. (Issue #137)
         if self.site:
             validated = _normalize_base_url(self.site)
             if not validated:
-                raise ValueError(f"Invalid or unsafe ZULIP_SITE: {self.site}")
+                raise ValueError(base_url_error(self.site))
             self.site = validated
+            if self.site.startswith("http://"):
+                logger.warning(
+                    "zulip: %s is set — the bot API key is sent unencrypted as "
+                    "HTTP Basic on every request [site=%s]",
+                    INSECURE_HTTP_ENV,
+                    mask_pii(self.site),
+                )
 
         _zulip = _import_zulip_sdk()
         if not _zulip:
@@ -613,6 +813,12 @@ class ZulipAdapter(BasePlatformAdapter):
         # Timeout configuration (Issue #62)
         self._connect_timeout, self._read_timeout, self._send_timeout = _resolve_timeouts()
 
+        # Abort budget for /events, raised once we learn the server's own
+        # long-poll budget from /register. Our 60s default is shorter than
+        # Zulip's 90s default, so without this we abort every idle long-poll
+        # client-side. (Issue #146)
+        self._events_timeout = self._read_timeout
+
         # Stream filtering (Issue #65) — None means all streams
         self._streams_filter = _resolve_streams_filter()
 
@@ -641,10 +847,7 @@ class ZulipAdapter(BasePlatformAdapter):
         self._queue_mgr = ZulipQueueManager(
             account_id=self.email or "default",
             data_dir=self._data_dir,
-            register_fn=lambda: self.client.register(
-                event_types=self._required_event_types,
-                fetch_event_id=0,
-            ),
+            register_fn=self._register_queue,
             event_types=self._required_event_types,
         )
         self._dedupe = ZulipDedupeStore(
@@ -676,6 +879,23 @@ class ZulipAdapter(BasePlatformAdapter):
         self._listening = False
         self._event_task: Optional[asyncio.Task] = None
         self._presence_task: Optional[asyncio.Task] = None
+
+        # Activity trace (epic #139 / #158): one bot-owned status message per
+        # work item, edited in place. Disabled unless ZULIP_ACTIVITY_TRACE is set.
+        self._trace_cfg = TraceConfig.from_env()
+        self._traces: dict[str, ActivityTrace] = {}
+        self._trace_start_tasks: dict[str, asyncio.Task] = {}
+        self._trace_started: dict[str, float] = {}
+        self._trace_replied: set[str] = set()
+        # Aliases (host session key, chat+topic route) -> trace key, so a tool
+        # callback running in another thread/task can still find its trace.
+        self._trace_sessions: dict[str, str] = {}
+        _LIVE_ADAPTERS.add(self)
+        if self._trace_cfg.enabled and ProcessingOutcome is None:
+            logger.warning(
+                "ZULIP_ACTIVITY_TRACE is enabled but this gateway does not expose "
+                "the processing lifecycle hooks; the trace will not run"
+            )
 
     async def _sdk_call(self, fn, *args, timeout: float, **kwargs):
         """Wrap a synchronous SDK call in asyncio.to_thread + asyncio.wait_for.
@@ -736,8 +956,9 @@ class ZulipAdapter(BasePlatformAdapter):
     ) -> Optional[dict]:
         """Map a gateway chat_id to Zulip set_typing_status params.
 
-        DM session rotation can suffix chat ids ("dm:<id>:session:<n>") —
-        strip to the raw numeric sender id. Streams are numeric stream ids;
+        DM session rotation can suffix chat ids ("dm:<id>:session:<n>"), and a
+        group DM carries every recipient ("dm:<id>,<id>"); both are stripped to
+        the recipient list. Streams are numeric stream ids;
         ``topic`` (the routing metadata's thread_id) wins over the per-stream
         reply cache, so typing shows in the session's own topic.
         """
@@ -745,10 +966,17 @@ class ZulipAdapter(BasePlatformAdapter):
             return None
         parts = chat_id.split(":")
         if parts[0] == "dm":
-            user_id = parts[1] if len(parts) > 1 else ""
-            if not user_id.isdigit():
+            if len(parts) < 2:
                 return None
-            return {"op": op, "type": "direct", "to": [int(user_id)]}
+            try:
+                user_ids = [
+                    int(part) for part in parts[1].split(",") if part.strip()
+                ]
+            except ValueError:
+                return None
+            if not user_ids:
+                return None
+            return {"op": op, "type": "direct", "to": user_ids}
         if chat_id.isdigit():
             resolved = (topic or "").strip() or self._topic_cache.get(chat_id, "")
             return {
@@ -794,6 +1022,272 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
         except Exception:
             pass  # typing is best-effort
+
+    # --- activity trace lifecycle (epic #139 / #158) ---
+
+    @staticmethod
+    def _trace_key(chat_id: str, metadata: Any) -> str:
+        """Session key for a trace: the chat *plus* the topic it lands in.
+
+        Topic sessions share a chat_id across topics, so keying on chat_id alone
+        would let two concurrent topics in one stream edit each other's trace.
+        """
+        return f"{chat_id}\x00{_metadata_topic(metadata) or ''}"
+
+    def _trace_payload(
+        self, chat_id: str, metadata: Any, content: str
+    ) -> Optional[dict]:
+        """Send payload for a trace message, using the *reply* routing.
+
+        Deliberately the same resolution the reply uses (``_metadata_topic`` and
+        ``_parse_target``). Issue #143 was a second, drifting topic resolution,
+        and a trace that lands in the wrong topic is worse than no trace.
+        """
+        try:
+            target = _parse_target(chat_id)
+        except (TypeError, ValueError):
+            return None
+        if target["type"] == "dm":
+            return {"type": "private", "to": target["user_ids"], "content": content}
+        # Same resolution the reply path uses (_routed_topic): with stable
+        # topic sessions metadata.topic is a conversation id, and a raw
+        # send would materialize a ghost topic named like the id (#143 lesson:
+        # no second, drifting resolution).
+        topic = (
+            self._routed_topic(target["stream_id"], metadata)
+            or self._topic_cache.get(chat_id, "general")
+        )
+        return {
+            "type": "stream",
+            "to": target["stream_id"],
+            "topic": topic,
+            "content": content,
+        }
+
+    def _note_trace_reply(self, chat_id: str, metadata: Any) -> None:
+        """Record that this work item actually produced a reply."""
+        if self._traces:
+            self._trace_replied.add(self._trace_key(chat_id, metadata))
+
+    def _session_key_for_event(self, event: Any) -> Optional[str]:
+        """The host's own session key for an event, when it exposes one.
+
+        Reused rather than reimplemented: a second key derivation would drift
+        from the host's, which is the #143 lesson. Returns None when the host
+        offers no such method, so callers fall back to the route alias.
+        """
+        getter = getattr(self, "_event_session_key", None)
+        if not callable(getter):
+            return None
+        try:
+            key = getter(event)
+        except Exception:
+            return None
+        return str(key) if key else None
+
+    def _session_aliases(self, event: Any) -> list[str]:
+        """Aliases that identify this event's run, as seen from the adapter."""
+        aliases: list[str] = []
+        session_key = self._session_key_for_event(event)
+        if session_key:
+            aliases.append(f"key:{session_key}")
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if chat_id:
+            thread = _metadata_topic(getattr(event, "metadata", None)) or ""
+            aliases.append(f"route:{chat_id}\x00{thread}")
+        return aliases
+
+    @staticmethod
+    def _session_aliases_from_context() -> list[str]:
+        """The same aliases, read from the *current* task's session context.
+
+        Tool callbacks run outside the adapter, so this is how they recover
+        which run they belong to. The hook payload's ``session_id`` is the
+        agent-side durable id and is deliberately **not** used: it is derived
+        differently from the adapter session key, so matching on it would be a
+        guess.
+        """
+        if _host_get_session_env is None:
+            return []
+        try:
+            key = _host_get_session_env("HERMES_SESSION_KEY") or ""
+            chat_id = _host_get_session_env("HERMES_SESSION_CHAT_ID") or ""
+            thread = _host_get_session_env("HERMES_SESSION_THREAD_ID") or ""
+        except Exception:
+            return []
+        aliases: list[str] = []
+        if key:
+            aliases.append(f"key:{key}")
+        if chat_id:
+            aliases.append(f"route:{chat_id}\x00{thread}")
+        return aliases
+
+    def _trace_for_current_session(self) -> Optional[ActivityTrace]:
+        """The trace for the task we are running inside, or None.
+
+        Shared by the tool hook (mode A) and the progress tool (mode B) so both
+        attribute through exactly **one** code path — two would drift.
+        """
+        if not self._trace_cfg.enabled or not self._trace_sessions:
+            return None
+        for alias in self._session_aliases_from_context():
+            key = self._trace_sessions.get(alias)
+            if key is not None:
+                return self._traces.get(key)
+        return None
+
+    def record_progress_step(self, note: str) -> bool:
+        """Add an agent-authored step (mode B). True when it was shown."""
+        trace = self._trace_for_current_session()
+        if trace is None:
+            return False
+        step = trace.step(str(note))
+        trace.complete(step, ok=True)
+        return step is not None
+
+    def record_tool_step(
+        self,
+        *,
+        tool_name: str = "",
+        status: Optional[str] = None,
+        duration_ms: int = 0,
+        error_type: Optional[str] = None,
+        **_: Any,
+    ) -> None:
+        """Attach a finished tool call to its work item's trace.
+
+        A step whose run cannot be identified is **dropped**, never guessed into
+        some other topic: a trace that narrates another conversation's work is
+        worse than a trace with a gap.
+        """
+        trace = self._trace_for_current_session()
+        if trace is None:
+            return
+
+        ok = (status or "ok") != "error"
+        detail = ""
+        if ok and duration_ms:
+            detail = f"{duration_ms} ms"
+        elif not ok:
+            detail = error_type or "failed"
+        step = trace.step(str(tool_name or "tool"))
+        trace.complete(step, ok=ok, detail=detail)
+
+    def _start_trace(self, event: Any) -> None:
+        """Begin a trace for a work item. Never raises, never blocks the run."""
+        if not self._trace_cfg.enabled:
+            return
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        metadata = getattr(event, "metadata", None)
+        if not chat_id:
+            return
+
+        key = self._trace_key(chat_id, metadata)
+        if key in self._traces:
+            return  # already tracing this work item
+
+        async def post(content: str) -> Optional[int]:
+            payload = self._trace_payload(chat_id, metadata, content)
+            if payload is None:
+                return None
+            result = await self._sdk_call(
+                self.client.send_message, payload, timeout=self._send_timeout
+            )
+            if not isinstance(result, dict) or result.get("result") != "success":
+                return None
+            try:
+                return int(result.get("id"))
+            except (TypeError, ValueError):
+                return None
+
+        async def edit(message_id: int, content: str) -> bool:
+            result = await self._sdk_call(
+                self.client.update_message,
+                {"message_id": message_id, "content": content},
+                timeout=self._send_timeout,
+            )
+            return isinstance(result, dict) and result.get("result") == "success"
+
+        trace = ActivityTrace(post, edit, self._trace_cfg)
+        self._traces[key] = trace
+        self._trace_started[key] = time.monotonic()
+        for alias in self._session_aliases(event):
+            self._trace_sessions[alias] = key
+        # Posted in the background: that is one API round-trip and the agent run
+        # must not wait on it. ``_finish_trace`` awaits this task before
+        # finalizing, so a fast turn cannot leave a stale "Working" board.
+        try:
+            self._trace_start_tasks[key] = asyncio.get_running_loop().create_task(
+                trace.start()
+            )
+        except RuntimeError:  # no running loop (sync caller): the trace is inert
+            pass
+
+    async def _finish_trace(self, event: Any, outcome: Any) -> None:
+        """Finalize a work item's trace. Never raises into the gateway loop."""
+        if not self._trace_cfg.enabled:
+            return
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        metadata = getattr(event, "metadata", None)
+        key = self._trace_key(chat_id, metadata)
+        trace = self._traces.pop(key, None)
+        if trace is None:
+            return
+
+        task = self._trace_start_tasks.pop(key, None)
+        if task is not None:
+            try:
+                await task
+            except Exception:
+                pass  # a failed post already dropped the trace
+
+        started = self._trace_started.pop(key, None)
+        for alias, mapped in list(self._trace_sessions.items()):
+            if mapped == key:
+                self._trace_sessions.pop(alias, None)
+        elapsed = max(0.0, time.monotonic() - started) if started else 0.0
+        replied = key in self._trace_replied
+        self._trace_replied.discard(key)
+
+        status = getattr(outcome, "value", outcome)
+        try:
+            if status == "cancelled":
+                note = f"cancelled after {elapsed:.0f}s"
+                if not replied:
+                    note += " — no reply sent"
+                await trace.finish(note=note)
+            elif status == "failure":
+                note = f"run failed after {elapsed:.0f}s"
+                if not replied:
+                    note += " — no reply sent"
+                await trace.fail(note)
+            elif replied:
+                await trace.finish(note=f"replied in {elapsed:.0f}s")
+            else:
+                # The case that used to be invisible: the run produced nothing.
+                await trace.finish(
+                    note=f"run finished in {elapsed:.0f}s — no reply sent"
+                )
+        except Exception as e:
+            logger.warning("activity trace finalize failed (dropped): %s", e)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Gateway lifecycle hook: a work item started. (epic #139 / #158)"""
+        self._start_trace(event)
+
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: Any = None
+    ) -> None:
+        """Gateway lifecycle hook: a work item finished, with its outcome.
+
+        The gateway supplies SUCCESS / FAILURE / CANCELLED, which is what makes
+        error and abort distinguishable at all — and therefore what lets a run
+        that produced nothing say so instead of staying silent.
+        """
+        await self._finish_trace(event, outcome)
 
     async def _mark_read(self, message_id: Any) -> None:
         """Mark a message as read. Best-effort."""
@@ -972,6 +1466,48 @@ class ZulipAdapter(BasePlatformAdapter):
             mask_pii(self.email),
         )
 
+    def _register_queue(self) -> dict:
+        """Register the event queue, learning the server's long-poll budget.
+
+        ``fetch_event_types: ["realm"]`` is what makes Zulip include
+        ``event_queue_longpoll_timeout_seconds`` in the response; without it
+        the field is omitted and there is no way to know how long the server
+        intends to hold a /events long-poll. Knowing it lets the poll loop
+        abort *after* the server's own budget instead of pre-empting a healthy
+        idle poll with our shorter generic read timeout. (Issue #146)
+        """
+        result = self.client.register(
+            # Full subscription (message + update_message + delete_message):
+            # stable topic sessions need rename/deletion events; the queue
+            # manager validates the persisted subscription against
+            # ``event_types`` and re-registers on mismatch.
+            event_types=list(self._required_event_types),
+            fetch_event_id=0,
+            fetch_event_types=["realm"],
+        )
+
+        raw_budget = None
+        if isinstance(result, dict):
+            raw_budget = result.get("event_queue_longpoll_timeout_seconds")
+        budget = _clamp_longpoll_budget(raw_budget)
+        if budget is not None:
+            self._events_timeout = max(
+                self._read_timeout, budget + LONGPOLL_GRACE_SECONDS
+            )
+            logger.info(
+                "zulip long-poll budget learned [server=%.0fs client_abort=%.0fs]",
+                budget,
+                self._events_timeout,
+            )
+        else:
+            logger.debug(
+                "zulip long-poll budget absent from /register; "
+                "keeping client abort budget at %.0fs",
+                self._events_timeout,
+            )
+
+        return result
+
     async def _presence_heartbeat(self):
         """Keep bot presence active while connected."""
         while self._listening:
@@ -989,16 +1525,22 @@ class ZulipAdapter(BasePlatformAdapter):
         """Listen for incoming Zulip messages via persistent event queue."""
         logger.info("zulip adapter listening [account=%s]", mask_pii(self.email))
 
+        # Latency-gated backoff state (Issue #146). Stays 0.0 while the server
+        # holds the long-poll — the healthy case, which must not slow down.
+        backoff = 0.0
+
         while self._listening:
             try:
                 queue = await self._queue_mgr.ensure_queue()
 
+                poll_started = time.monotonic()
                 events = await self._sdk_call(
                     self.client.get_events,
                     queue_id=queue.queue_id,
                     last_event_id=queue.last_event_id,
-                    timeout=self._read_timeout,
+                    timeout=self._events_timeout,
                 )
+                poll_elapsed = time.monotonic() - poll_started
 
                 if events.get("result") == "error":
                     msg = events.get("msg", "")
@@ -1023,11 +1565,15 @@ class ZulipAdapter(BasePlatformAdapter):
 
                 batch_max_event_id = queue.last_event_id
                 processing_tasks = []
+                had_message = False
                 for event in events.get("events", []):
                     event_id = event["id"]
                     if event_id > batch_max_event_id:
                         batch_max_event_id = event_id
                     if event.get("type") == "message":
+                        # Any delivered message means this poll had work to do,
+                        # so it is a real return even when dedupe drops it.
+                        had_message = True
                         msg = _message_with_flags(event)
                         msg_id = str(msg.get("id", ""))
                         # Dedupe check
@@ -1065,6 +1611,16 @@ class ZulipAdapter(BasePlatformAdapter):
                 # Batch update event ID
                 if batch_max_event_id > queue.last_event_id:
                     self._queue_mgr.update_last_event_id(batch_max_event_id)
+
+                # Pace only a poll the server did not hold (Issue #146).
+                backoff = _next_poll_backoff(poll_elapsed, had_message, backoff)
+                if backoff:
+                    logger.debug(
+                        "zulip poll backoff [delay=%.1fs last_poll=%.2fs]",
+                        backoff,
+                        poll_elapsed,
+                    )
+                    await asyncio.sleep(backoff)
 
             except asyncio.CancelledError:
                 raise
@@ -1878,7 +2434,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 cmd_chat_id = str(message.get("stream_id", ""))
                 cmd_topic = message.get("subject", "")
             else:
-                cmd_chat_id = f"dm:{message.get('sender_id', '')}"
+                cmd_chat_id = _private_chat_id(message)
                 cmd_topic = None
 
             # /continue and /topic-sessions (stable topic sessions): manual
@@ -1931,7 +2487,7 @@ class ZulipAdapter(BasePlatformAdapter):
                             self.client.send_message,
                             {
                                 "type": "private",
-                                "to": [message.get("sender_id")],
+                                "to": _private_recipient_ids(message),
                                 "content": cmd_result.reply,
                             },
                             timeout=self._send_timeout,
@@ -1970,7 +2526,7 @@ class ZulipAdapter(BasePlatformAdapter):
                         self.client.send_message,
                         {
                             "type": "private",
-                            "to": [message.get("sender_id")],
+                            "to": _private_recipient_ids(message),
                             "content": reply,
                         },
                         timeout=self._send_timeout,
@@ -2022,7 +2578,7 @@ class ZulipAdapter(BasePlatformAdapter):
             extra_meta = {"topic": topic, "stream_id": stream_id}
         else:
             sender_id = message.get("sender_id")
-            chat_id = f"dm:{sender_id}"
+            chat_id = _private_chat_id(message)
 
             # DM session rotation: prevent context bloat by rotating
             # the session key every N turns (default 20, 0 to disable).
@@ -2041,7 +2597,11 @@ class ZulipAdapter(BasePlatformAdapter):
                 user_id=sender_email,
                 user_name=sender_full_name,
             )
-            extra_meta = {"user_id": sender_id, "user_email": sender_email}
+            extra_meta = {
+                "user_id": sender_id,
+                "user_email": sender_email,
+                "recipient_ids": _private_recipient_ids(message),
+            }
 
         # --- Context-mitigation metadata ---
         now = time.time()
@@ -2381,7 +2941,9 @@ class ZulipAdapter(BasePlatformAdapter):
     ) -> SendResult:
         data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
         try:
-            url = await upload_file_to_zulip(self.client, file_path, data_dir)
+            url = await upload_file_to_zulip(
+                self.client, file_path, data_dir, account_id=self.email
+            )
         except Exception as e:
             logger.error(
                 "[%s] native media upload failed [file=%s]: %s",
@@ -2508,7 +3070,7 @@ class ZulipAdapter(BasePlatformAdapter):
             return SendResult(success=False, message_id="")
 
         if target["type"] == "dm":
-            base: dict[str, Any] = {"type": "private", "to": [target["user_id"]]}
+            base: dict[str, Any] = {"type": "private", "to": target["user_ids"]}
         else:
             # prompt.metadata carries the turn's routing metadata (thread_id =
             # a conversation id with stable topic sessions, else the topic
@@ -2561,6 +3123,53 @@ class ZulipAdapter(BasePlatformAdapter):
             return widget_result
         return context_result or SendResult(success=False, message_id="")
 
+    def _known_secrets(self) -> list[KnownSecret]:
+        """Credential values that must never be transmitted (Issue #136).
+
+        Memoised: the credential set does not change at runtime, and re-walking
+        the config and environment on every send would be wasted work.
+        """
+        if self._known_secrets_cache is None:
+            self._known_secrets_cache = collect_known_secrets(
+                self._platform_extra,
+                extra=[("zulip.api_key", self.api_key)],
+                env=os.environ,
+            )
+        return self._known_secrets_cache
+
+    def _detect_secret_leak(self, content: str) -> list[KnownSecret]:
+        """Credentials ``content`` would transmit, if the guard is enabled."""
+        if not block_secret_leaks_enabled():
+            return []
+        return find_leaked_secrets(content, self._known_secrets())
+
+    async def _refuse_secret_leak(
+        self, hits: list[KnownSecret], chat_id: str
+    ) -> str:
+        """Audit a refused send, naming only *where* the credential came from.
+
+        The value itself is never logged or audited: a message describing a
+        leak must not become one. (Issue #136)
+        """
+        summary = describe_leaked_secrets(hits)
+        logger.error(
+            format_zulip_log(
+                "zulip outbound blocked: message contained host credentials",
+                chat_id=mask_pii(str(chat_id)),
+                leaked=summary,
+            )
+        )
+        await self._audit_logger.log_event(
+            "secret_leak_blocked",
+            {
+                "chat_id": mask_pii(str(chat_id)),
+                "direction": "outbound",
+                "sources": [hit.name for hit in hits],
+                "count": len(hits),
+            },
+        )
+        return summary
+
     async def send(
         self,
         chat_id: str,
@@ -2572,6 +3181,17 @@ class ZulipAdapter(BasePlatformAdapter):
         """Send message to a Zulip stream or DM, with chunking, topic directives, and files."""
         metadata = metadata or {}
         media_files = media_files or []
+
+        # Outbound secret guard (Issue #136). Checked before media upload, so a
+        # message we are about to refuse cannot leave a stray upload behind.
+        leaked = self._detect_secret_leak(content)
+        if leaked:
+            summary = await self._refuse_secret_leak(leaked, chat_id)
+            logger.error(
+                "zulip send refused: %s. Remove it and rotate the credential.",
+                summary,
+            )
+            return SendResult(success=False, message_id="")
 
         # Upload files first
         uploaded_urls = []
@@ -2588,7 +3208,7 @@ class ZulipAdapter(BasePlatformAdapter):
                     continue
                 try:
                     url = await upload_file_to_zulip(
-                        self.client, file_path, data_dir
+                        self.client, file_path, data_dir, account_id=self.email
                     )
                     uploaded_urls.append(url)
                     uploaded_local_paths.append(file_path)
@@ -2657,7 +3277,7 @@ class ZulipAdapter(BasePlatformAdapter):
                     self.client.send_message,
                     {
                         "type": "private",
-                        "to": [target["user_id"]],
+                        "to": target["user_ids"],
                         "content": content,
                     },
                     timeout=self._send_timeout,
@@ -2681,6 +3301,9 @@ class ZulipAdapter(BasePlatformAdapter):
 
             if result.get("result") == "success":
                 logger.debug("zulip message sent to %s", chat_id)
+                # This work item produced a reply, so its trace can say so
+                # instead of reporting a silent run (epic #139 / #158).
+                self._note_trace_reply(chat_id, metadata)
                 return SendResult(
                     success=True, message_id=str(result.get("id", ""))
                 )
@@ -2766,7 +3389,16 @@ def interactive_setup() -> None:
     if not site:
         print_warning("Site URL is required — skipping Zulip setup")
         return
-    save_env_value("ZULIP_SITE", site.rstrip("/").strip())
+
+    # https only, unless the operator already opted into insecure http
+    # (Issue #137). The opt-in is read at validation time rather than captured
+    # here, so a self-hosted http:// realm keeps working on later calls — the
+    # sibling's bug was the flag being discarded after this point.
+    normalized_site = _normalize_base_url(site)
+    if not normalized_site:
+        print_warning(base_url_error(site))
+        return
+    save_env_value("ZULIP_SITE", normalized_site)
 
     email = prompt(
         "Bot email address (e.g. hermes-bot@your-org.zulipchat.com)",
@@ -2837,7 +3469,9 @@ async def _standalone_send(
 
     Arguments follow the contract in ``gateway/platform_registry.py``:
 
-    * ``chat_id`` — ``<stream_id>`` or ``dm:<user_id>`` (see :func:`_parse_target`).
+    * ``chat_id`` — ``<stream_id>`` or ``dm:<user_id>[,<user_id>…]`` (see
+      :func:`_parse_target`). Multiple comma-separated ids address a Zulip
+      group direct message.
     * ``thread_id`` — the optional third segment of a ``zulip:<stream>:<topic>``
       target; used as the Zulip topic. An inline ``[[zulip_topic: …]]`` directive in
       the message wins over it, and :data:`STANDALONE_DEFAULT_TOPIC` is used
@@ -2870,9 +3504,52 @@ async def _standalone_send(
         return {
             "error": (
                 f"Invalid Zulip target {chat_id!r}: expected a numeric stream id "
-                f"or 'dm:<user_id>'"
+                f"or 'dm:<user_id>[,<user_id>…]'"
             )
         }
+
+    # Outbound secret guard (Issue #136). The out-of-process path needs this
+    # just as much as send(): cron-injected text can carry a credential too.
+    if block_secret_leaks_enabled():
+        leaked = find_leaked_secrets(
+            message,
+            collect_known_secrets(
+                getattr(pconfig, "extra", None),
+                extra=[("zulip.api_key", api_key)],
+                env=os.environ,
+            ),
+        )
+        if leaked:
+            summary = describe_leaked_secrets(leaked)
+            logger.error(
+                "zulip standalone delivery blocked: message contained host "
+                "credentials [%s]",
+                summary,
+            )
+            try:
+                await AuditLogger(
+                    data_dir=os.environ.get(
+                        "HERMES_DATA_DIR", os.path.expanduser("~/.hermes")
+                    ),
+                    account_id=email or "default",
+                ).log_event(
+                    "secret_leak_blocked",
+                    {
+                        "chat_id": mask_pii(str(chat_id)),
+                        "direction": "outbound",
+                        "transport": "standalone",
+                        "sources": [hit.name for hit in leaked],
+                        "count": len(leaked),
+                    },
+                )
+            except Exception:
+                pass  # auditing must never break the refusal itself
+            return {
+                "error": (
+                    f"Refusing to deliver: the message contains {summary}. "
+                    f"Remove it and rotate the credential."
+                )
+            }
 
     _connect_timeout, _read_timeout, send_timeout = _resolve_timeouts()
     content = message or ""
@@ -2893,7 +3570,9 @@ async def _standalone_send(
                 continue
             try:
                 uploaded_urls.append(
-                    await upload_file_to_zulip(client, file_path, data_dir)
+                    await upload_file_to_zulip(
+                        client, file_path, data_dir, account_id=email
+                    )
                 )
             except Exception as e:
                 logger.error(
@@ -2917,7 +3596,7 @@ async def _standalone_send(
         content = prefix + content
 
     if target["type"] == "dm":
-        payload = {"type": "private", "to": [target["user_id"]], "content": content}
+        payload = {"type": "private", "to": target["user_ids"], "content": content}
     else:
         topic = topic_directive or (str(thread_id).strip() if thread_id else "") or STANDALONE_DEFAULT_TOPIC
         payload = {
@@ -2950,6 +3629,55 @@ async def _standalone_send(
 
 def register(ctx):
     """Plugin entry point — called by the Hermes plugin system."""
+    # Activity-trace tool checkpoints (epic #139 / #159).
+    #
+    # Registered ONLY when the trace is enabled: any registration flips
+    # has_hook("post_tool_call") true and switches on host-side dispatch, so
+    # gating by *not registering* is what keeps a disabled trace free.
+    #
+    # ``pre_tool_call`` is deliberately never registered — it is fail-closed
+    # (it returns (block_message, modified_args)), so a status observer could
+    # block the agent's own tool call.
+    if TraceConfig.from_env().enabled:
+        try:
+            ctx.register_hook("post_tool_call", _on_post_tool_call)
+        except Exception as e:
+            logger.warning("zulip: could not register post_tool_call hook: %s", e)
+
+    # Mode B (epic #139 / #160): let the agent narrate intent that hooks cannot
+    # infer. Registered only when the trace is enabled — registration is what
+    # exposes the tool to the model, so a disabled trace must not advertise one.
+    if TraceConfig.from_env().enabled:
+        try:
+            ctx.register_tool(
+                name="zulip_progress",
+                toolset="zulip",
+                schema={
+                    "name": "zulip_progress",
+                    "description": (
+                        "Show a short progress note on this conversation's activity "
+                        "board while you work. Use it for intent that a tool call does "
+                        "not reveal, e.g. 'about to ask a clarifying question' or "
+                        "'switching approach'."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "note": {
+                                "type": "string",
+                                "description": "Short status line, e.g. 'checking the logs'.",
+                            }
+                        },
+                        "required": ["note"],
+                    },
+                },
+                handler=_zulip_progress_handler,
+                description="Show a short progress note on the activity trace",
+                emoji="\U0001f4dd",
+            )
+        except Exception as e:
+            logger.warning("zulip: could not register zulip_progress tool: %s", e)
+
     ctx.register_platform(
         name="zulip",
         label="Zulip",
