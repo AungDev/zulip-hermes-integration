@@ -1430,14 +1430,16 @@ class ZulipAdapter(BasePlatformAdapter):
     def _continue_command_reply(
         self, stream_id: int, topic: str, arg: str = ""
     ) -> str:
-        """``/continue <session-id>`` (R7, inheritance-scoped).
+        """``/continue <gateway-session-id>`` (R7, inheritance-scoped).
 
-        Re-binds this topic to a session from ITS OWN session set — the
-        sessions it created plus those handed to it by full renames
-        (merges) — as listed by ``/topic-sessions``. Bare ``/continue``
-        does nothing: there is no implicit pick, and a session held by
-        another topic (or orphaned) can never be named here, because it
-        is not part of this topic's set.
+        Switches this topic to a gateway session from ITS OWN session
+        set — the lineages it created plus those handed to it by full
+        renames (merges) — as listed by ``/topic-sessions``. Only a
+        gateway session id is accepted (user ruling): lineage
+        (conversation) ids are grouping labels, not switch tokens.
+        Bare ``/continue`` does nothing: there is no implicit pick, and
+        a session held by another topic (or orphaned) can never be
+        named here, because its lineage is not part of this topic's set.
         """
         if self._conversations is None:
             return (
@@ -1447,51 +1449,25 @@ class ZulipAdapter(BasePlatformAdapter):
         arg = (arg or "").strip()
         if not arg:
             return (
-                "Usage: `/continue <id>` — switch this topic to one of its own"
-                " sessions. `<id>` is either a conversation id (`c` + 12 hex)"
-                " or a gateway session id (`YYYYMMDD_HHMMSS_hex`), as listed by"
-                " `/topic-sessions`. `/continue` alone does nothing."
+                "Usage: `/continue <session-id>` — switch this topic to one"
+                " of its own gateway sessions (`YYYYMMDD_HHMMSS_hex`, as"
+                " listed by `/topic-sessions`). `/continue` alone does"
+                " nothing."
             )
         token = arg.split()[0]
         if _GATEWAY_SESSION_ID_RE.fullmatch(token):
             return self._continue_to_gateway_session(stream_id, topic, token)
-        conversation_id = token
-        if not _CONVERSATION_ID_RE.fullmatch(conversation_id):
+        if _CONVERSATION_ID_RE.fullmatch(token):
             return (
-                "That is not a session id (expected a conversation id —"
-                " `c` + 12 hex — or a gateway session id —"
-                " `YYYYMMDD_HHMMSS_hex`, as shown by `/topic-sessions`)."
-                " Nothing was changed."
+                "That is a conversation (lineage) id — lineage ids group"
+                " sessions in `/topic-sessions` but are not switchable."
+                " Use a **gateway session id** (`YYYYMMDD_HHMMSS_hex`),"
+                " as listed under each lineage. Nothing was changed."
             )
-        current = self._conversations.lookup(stream_id, topic)
-        if current is None:
-            return "This topic has no session yet — nothing to continue."
-        if conversation_id == current:
-            return "That session is already the current one here."
-        member_ids = {
-            member_id
-            for member_id, _origin in self._conversations.sessions_for_topic(
-                stream_id, topic
-            )[2]
-        }
-        if conversation_id not in member_ids:
-            return (
-                "That session is not part of this topic's session set"
-                " (own + inherited) — a session held by another topic or"
-                " orphaned cannot be continued. Nothing was changed."
-                " See `/topic-sessions`."
-            )
-        previous = current
-        self._conversations.rebind(stream_id, topic, conversation_id)
-        origin = self._conversations.sessions_for_topic(stream_id, topic)[1]
-        logger.debug(
-            "zulip conversation rebound via /continue [channel=%s conv=%s topic=%r]",
-            stream_id, conversation_id, mask_pii(topic),
-        )
         return (
-            f"🔗 This topic now continues session `{conversation_id}`"
-            f" (started in **{origin}**). The previous session stays here"
-            f" as a former session — `/continue {previous}` switches back."
+            "That is not a gateway session id (expected"
+            " `YYYYMMDD_HHMMSS_hex`, as shown by `/topic-sessions`)."
+            " Nothing was changed."
         )
 
     def _continue_to_gateway_session(
@@ -1548,6 +1524,8 @@ class ZulipAdapter(BasePlatformAdapter):
         current = self._conversations.lookup(stream_id, topic)
         if current is None:
             return "This topic has no session yet — nothing to continue."
+        if conversation_id == current and entry is not None:
+            return f"Already talking in session `{session_id}` here."
         if conversation_id != current:
             member_ids = {
                 member_id
