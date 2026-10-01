@@ -15,6 +15,7 @@ import time
 import weakref
 from dataclasses import replace as _dc_replace
 from collections import OrderedDict
+from functools import partial
 from pathlib import Path
 from typing import Optional, Any, overload
 
@@ -59,15 +60,33 @@ from .text_utils import (
     create_mention_regex,
     normalize_mention,
     strip_html_to_text,
+    strip_think_blocks,
 )
+from .display_names import DisplayNameCache
+from .refs import render_refs
 from .media import upload_file_to_zulip
 from .queue_manager import ZulipQueueManager
 from .dedupe_store import ZulipDedupeStore
 from .reactions import ReactionConfig, ReactionLifecycle
+from .reaction_triggers import (
+    ReactionTriggerConfig,
+    build_reaction_trigger_message,
+    find_unsubscribed_streams,
+    is_eligible_target_message,
+    match_reaction_trigger,
+    reaction_dedupe_key,
+)
+from .session_queue import (
+    DEFAULT_QUEUE_CAP,
+    PendingTurn,
+    SessionQueue,
+    SessionQueueConfig,
+)
 from .version import __version__, __repo__
 from .commands import CommandResult, handle_command, is_command
 from .conversations import TopicConversationRegistry
 from .policy import PolicyEngine
+from . import runtime_scope
 from . import updater
 from .probe import (
     INSECURE_HTTP_ENV,
@@ -79,6 +98,15 @@ from .recovery import recover_interrupted_messages
 from .rate_limiter import RateLimiter
 from .audit_logger import AuditLogger
 from .activity_trace import ActivityTrace, TraceConfig
+from .engagement import (
+    MODE_OFF as ENGAGEMENT_MODE_OFF,
+    EngagementConfig,
+    EngagementEntry,
+    TopicEngagementStore,
+    format_expiry_notice_text,
+    is_end_session_message,
+    is_stop_listening_message,
+)
 
 # Per-task session context published by the gateway (epic #139 / #159). Guarded
 # like every other host symbol: on a gateway without it, tool steps simply
@@ -387,7 +415,7 @@ def _resolve_max_message_length() -> int:
     ``ZULIP_MAX_MESSAGE_LENGTH`` (default 20000, ``0`` disables). Applied in
     :meth:`ZulipAdapter.send` and :func:`_standalone_send` before chunking.
     """
-    raw = os.getenv("ZULIP_MAX_MESSAGE_LENGTH", "").strip()
+    raw = runtime_scope.get_setting("ZULIP_MAX_MESSAGE_LENGTH", "").strip()
     if not raw:
         return DEFAULT_MAX_MESSAGE_LENGTH
     try:
@@ -421,9 +449,9 @@ LONGPOLL_GRACE_SECONDS = 10.0
 
 def _resolve_chunk_config() -> tuple[int, str]:
     """Read chunking config from environment."""
-    limit_raw = os.getenv("ZULIP_TEXT_CHUNK_LIMIT", "").strip()
+    limit_raw = runtime_scope.get_setting("ZULIP_TEXT_CHUNK_LIMIT", "").strip()
     limit = int(limit_raw) if limit_raw.isdigit() else DEFAULT_CHUNK_LIMIT
-    mode = os.getenv("ZULIP_CHUNK_MODE", DEFAULT_CHUNK_MODE).strip()
+    mode = runtime_scope.get_setting("ZULIP_CHUNK_MODE", DEFAULT_CHUNK_MODE).strip()
     if mode not in ("length", "newline"):
         mode = DEFAULT_CHUNK_MODE
     return limit, mode
@@ -440,9 +468,9 @@ def _resolve_timeouts() -> tuple[float, float, float]:
         except (ValueError, AttributeError):
             return default
 
-    connect = _parse(os.getenv("ZULIP_CONNECT_TIMEOUT", ""), DEFAULT_CONNECT_TIMEOUT)
-    read = _parse(os.getenv("ZULIP_READ_TIMEOUT", ""), DEFAULT_READ_TIMEOUT)
-    send = _parse(os.getenv("ZULIP_SEND_TIMEOUT", ""), DEFAULT_SEND_TIMEOUT)
+    connect = _parse(runtime_scope.get_setting("ZULIP_CONNECT_TIMEOUT", ""), DEFAULT_CONNECT_TIMEOUT)
+    read = _parse(runtime_scope.get_setting("ZULIP_READ_TIMEOUT", ""), DEFAULT_READ_TIMEOUT)
+    send = _parse(runtime_scope.get_setting("ZULIP_SEND_TIMEOUT", ""), DEFAULT_SEND_TIMEOUT)
     return connect, read, send
 
 
@@ -481,7 +509,7 @@ def _resolve_streams_filter() -> set[str] | None:
     Returns None if all streams are allowed (default), or a set of
     lowercase stream names to monitor.
     """
-    raw = os.getenv("ZULIP_STREAMS", "").strip()
+    raw = runtime_scope.get_setting("ZULIP_STREAMS", "").strip()
     if not raw or raw == "*":
         return None
     return {s.strip().lower() for s in raw.split(",") if s.strip()}
@@ -489,7 +517,7 @@ def _resolve_streams_filter() -> set[str] | None:
 
 def _resolve_response_prefix() -> str:
     """Read outbound response prefix from environment."""
-    return os.getenv("ZULIP_RESPONSE_PREFIX", "")
+    return runtime_scope.get_setting("ZULIP_RESPONSE_PREFIX", "")
 
 
 def _resolve_stream_overrides() -> dict[str, dict[str, Any]]:
@@ -513,7 +541,7 @@ def _resolve_stream_overrides() -> dict[str, dict[str, Any]]:
     Unrecognised setting keys are warned about. Malformed configuration is
     logged and ignored rather than raised.
     """
-    raw = os.getenv("ZULIP_STREAM_OVERRIDES", "").strip()
+    raw = runtime_scope.get_setting("ZULIP_STREAM_OVERRIDES", "").strip()
     if len(raw.encode("utf-8")) > _MAX_JSON_OVERRIDES_BYTES:
         logger.warning(
             "ZULIP_STREAM_OVERRIDES exceeds max size (%d > %d bytes); ignoring overrides",
@@ -608,11 +636,11 @@ def _resolve_chatmode(stream_name: Optional[str] = None) -> tuple[str, list[str]
     ``ZULIP_STREAM_OVERRIDES`` takes precedence over the global
     ``ZULIP_CHATMODE`` for that stream only.
     """
-    mode = os.getenv("ZULIP_CHATMODE", "onmessage").strip().lower()
+    mode = runtime_scope.get_setting("ZULIP_CHATMODE", "onmessage").strip().lower()
     if mode not in ("onmessage", "oncall", "onchar"):
         mode = "onmessage"
-    prefixes = resolve_onchar_prefixes(os.getenv("ZULIP_ONCHAR_PREFIXES", ""))
-    require_mention = os.getenv("ZULIP_REQUIRE_MENTION", "true").strip().lower() not in ("false", "0", "no", "off")
+    prefixes = resolve_onchar_prefixes(runtime_scope.get_setting("ZULIP_ONCHAR_PREFIXES", ""))
+    require_mention = runtime_scope.get_setting("ZULIP_REQUIRE_MENTION", "true").strip().lower() not in ("false", "0", "no", "off")
 
     if stream_name:
         override = _resolve_stream_overrides().get(stream_name.strip().lower())
@@ -620,6 +648,261 @@ def _resolve_chatmode(stream_name: Optional[str] = None) -> tuple[str, list[str]
             mode = override.get("chatmode", mode)
 
     return mode, prefixes, require_mention
+
+
+def _user_lookup_call(client: Any, user_id_or_email: Any):
+    """Resolve ``(callable, args)`` for a single-user lookup.
+
+    The ``zulip`` SDK exposes no single consistent method for this: 0.9.1 has
+    ``get_user_by_id`` and ``call_endpoint`` but **no** ``get_user``, while some
+    other builds do provide ``get_user`` (issue #196). ``GET /users/{value}``
+    accepts either a numeric id or an email address, so the raw endpoint covers
+    the email case that ``get_user_by_id`` cannot.
+    """
+    raw = str(user_id_or_email or "").strip()
+    if not raw:
+        return None, ()
+    by_id = getattr(client, "get_user_by_id", None)
+    if raw.isdigit() and callable(by_id):
+        return by_id, (int(raw),)
+    endpoint = getattr(client, "call_endpoint", None)
+    if callable(endpoint):
+        return partial(endpoint, url=f"users/{raw}", method="GET"), ()
+    legacy = getattr(client, "get_user", None)
+    if callable(legacy):
+        return legacy, (raw,)
+    return None, ()
+
+
+def _resolve_soft_gate() -> bool:
+    """Whether monitored stream messages are all dispatched (issue #153).
+
+    Off by default. When on, a stream message is dispatched like
+    ``ZULIP_CHATMODE=onmessage`` but its metadata carries ``addressed=False``
+    unless the bot was mentioned or an onchar prefix fired, so the agent can
+    watch a busy stream without answering all of it.
+    """
+    return runtime_scope.get_setting("ZULIP_SOFT_GATE", "").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+
+
+def _resolve_observe_group() -> bool:
+    """Whether non-addressed stream messages are recorded as topic context.
+
+    Off by default (issue #153). Observed messages are kept in a bounded
+    in-adapter buffer and never dispatched; the buffer is prepended to the
+    agent-facing text the next time the bot is addressed in the same topic.
+    """
+    return runtime_scope.get_setting("ZULIP_OBSERVE_GROUP", "").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+
+
+def _resolve_session_queue() -> bool:
+    """Whether an inbound message waits for its session's run in flight (#151).
+
+    Off by default. When on, a message arriving while its topic (or DM) is
+    mid-run joins that session's FIFO instead of being steered into the running
+    turn, so one person in a shared topic cannot redirect another's work.
+    Separate sessions are untouched and still run in parallel.
+    """
+    return runtime_scope.get_setting("ZULIP_SESSION_QUEUE", "").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+
+
+def _resolve_history_mode() -> str:
+    """How much real stream/topic history is quoted into the prompt (#148).
+
+    ``off`` (default) never harvests, so no extra Zulip round-trip is made;
+    ``on-demand`` harvests only for a message that reads like a "do we already
+    know this?" question; ``always`` harvests for every inbound stream message.
+    Anything unrecognised falls back to ``off`` with a warning.
+    """
+    raw = (runtime_scope.get_setting("ZULIP_HISTORY_MODE", "") or "").strip().lower()
+    if raw in ("off", "on-demand", "always"):
+        return raw
+    if raw:
+        logger.warning(
+            "ZULIP_HISTORY_MODE=%r is not one of off/on-demand/always; using off",
+            raw,
+        )
+    return "off"
+
+
+def _resolve_int_setting(name: str, default: int, minimum: int = 1) -> int:
+    """Read a positive integer setting, warning and falling back when invalid."""
+    raw = (runtime_scope.get_setting(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if value < minimum:
+        logger.warning(
+            "%s=%d is below the minimum %d; using %d", name, value, minimum, default
+        )
+        return default
+    return value
+
+
+#: Caps for the observed-topic buffer (#153). Per topic *and* across topics, so
+#: neither one busy topic nor a long-running bot can grow without limit.
+OBSERVED_MAX_MESSAGES = 20
+OBSERVED_MAX_CHARS = 4000
+OBSERVED_MAX_TOPICS = 200
+
+#: Labels marking quoted context so the agent can tell it from the live
+#: message (#153, #148).
+OBSERVED_HISTORY_LABEL = "[Observed topic history - not addressed to you]"
+FETCHED_HISTORY_LABEL = "[Topic history - recent messages quoted for context]"
+
+#: Best-effort budget for one history harvest (#148). A slow or failing fetch
+#: is dropped rather than awaited beyond this.
+HISTORY_FETCH_TIMEOUT = 2.0
+
+#: Narrow "do we already know this?" question shapes for ``on-demand`` history
+#: (#148). Deliberately conservative: a harvest costs one Zulip round-trip and
+#: a slice of the context budget, so a passing mention of history is not enough.
+_HISTORY_INTENT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bhave we\b[^?]{0,80}\b(seen|had|discussed|covered|decided|talked)\b",
+        r"\bdid we\b[^?]{0,80}\b(discuss|decide|agree|see|cover|mention|talk)\b",
+        r"\bwhat did we\b",
+        r"\bwhen did we\b",
+        r"\bdo we (already )?(know|have)\b",
+        r"\b(as|like) (we|i) (discussed|mentioned|said|agreed)\b",
+        r"\bwe (already|previously)\b",
+        r"\b(earlier|previously|before now|last (week|month|time))\b",
+        r"\bhas this (come up|been (asked|raised|seen))\b",
+        r"\bany (prior|previous|earlier)\b",
+    )
+)
+
+
+def _history_intent_matches(text: str) -> bool:
+    """Whether ``text`` reads like a question about something already discussed."""
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _HISTORY_INTENT_PATTERNS)
+
+
+def _joined_len(lines: list[str]) -> int:
+    """Length of ``"\\n".join(lines)`` without building the string."""
+    if not lines:
+        return 0
+    return sum(len(line) for line in lines) + len(lines) - 1
+
+
+class ObservedContextBuffer:
+    """Bounded per-topic memory of stream messages the bot was not addressed in.
+
+    Deliberately in-adapter state (issue #153). The design source appended to
+    the host session transcript through ``gateway.session`` internals, which
+    this plugin cannot rely on, so observation is kept here instead: a
+    deterministic buffer keyed by ``(stream_id, topic)`` so topics never leak
+    into each other, bounded on three axes — lines per topic, characters per
+    topic, and tracked topics. The oldest line (or the least-recently-used
+    topic) is dropped first.
+    """
+
+    def __init__(
+        self,
+        max_messages: int = OBSERVED_MAX_MESSAGES,
+        max_chars: int = OBSERVED_MAX_CHARS,
+        max_topics: int = OBSERVED_MAX_TOPICS,
+    ):
+        self._max_messages = max(1, max_messages)
+        self._max_chars = max(1, max_chars)
+        self._max_topics = max(1, max_topics)
+        self._topics: "OrderedDict[tuple[str, str], list[str]]" = OrderedDict()
+
+    def add(self, stream_id: Any, topic: Any, line: str) -> None:
+        """Append one quoted line, evicting oldest entries to stay in budget."""
+        line = (line or "").strip()
+        if not line:
+            return
+        key = (str(stream_id), str(topic or ""))
+        lines = self._topics.get(key)
+        if lines is None:
+            lines = []
+            self._topics[key] = lines
+        self._topics.move_to_end(key)
+        lines.append(line)
+        self._trim(lines)
+        while len(self._topics) > self._max_topics:
+            self._topics.popitem(last=False)
+
+    def render(self, stream_id: Any, topic: Any) -> str:
+        """The buffered lines for one topic, oldest first; "" when none."""
+        lines = self._topics.get((str(stream_id), str(topic or "")))
+        if not lines:
+            return ""
+        return "\n".join(lines)
+
+    def _trim(self, lines: list[str]) -> None:
+        while len(lines) > self._max_messages:
+            lines.pop(0)
+        # Character budget: drop the oldest whole lines first, then truncate the
+        # oldest survivor if a single line still overshoots on its own.
+        while len(lines) > 1 and _joined_len(lines) > self._max_chars:
+            lines.pop(0)
+        if lines and len(lines[0]) > self._max_chars:
+            lines[0] = truncate_text(lines[0], self._max_chars)
+
+
+def _history_sort_key(message: dict) -> int:
+    """Integer message id for a stable oldest-first order; 0 when unusable."""
+    try:
+        return int(message.get("id"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _render_history_block(
+    messages: list[dict],
+    *,
+    max_messages: int,
+    window_hours: int,
+    max_chars: int,
+    now: Optional[float] = None,
+) -> str:
+    """Render the newest slice of ``messages`` as quoted history lines (#148).
+
+    Bounded on all three axes: at most ``max_messages`` lines, nothing older
+    than ``window_hours``, at most ``max_chars`` characters. The newest lines
+    win — oldest lines are dropped (and the oldest survivor truncated) so a
+    topic with months of history cannot blow up the context window.
+    """
+    if now is None:
+        now = time.time()
+    cutoff = now - window_hours * 3600
+
+    lines: list[str] = []
+    for message in sorted(messages, key=_history_sort_key):
+        timestamp = message.get("timestamp")
+        if isinstance(timestamp, (int, float)) and timestamp < cutoff:
+            continue
+        text = strip_html_to_text(str(message.get("content") or "")).strip()
+        if not text:
+            continue
+        sender = (
+            str(message.get("sender_full_name") or "").strip()
+            or str(message.get("sender_email") or "").strip()
+            or "Unknown"
+        )
+        lines.append(f"[{sender}] {text}")
+
+    lines = lines[-max_messages:]
+    while len(lines) > 1 and _joined_len(lines) > max_chars:
+        lines.pop(0)
+    if lines and len(lines[0]) > max_chars:
+        lines[0] = truncate_text(lines[0], max_chars)
+    return "\n".join(lines)
 
 
 def _message_with_flags(event: dict) -> dict:
@@ -693,6 +976,18 @@ def _split_session_key_tail(tail: str) -> tuple[str, Optional[str]]:
     return tail, None
 
 
+def _event_route(event: Any) -> tuple[str, Any]:
+    """``(chat_id, metadata)`` for a gateway event, or ``("", None)``.
+
+    The pair identifies the chat+topic route a work item's delivery events
+    belong to, so the activity trace and the delivery audit key work items
+    identically.
+    """
+    source = getattr(event, "source", None)
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    return chat_id, getattr(event, "metadata", None)
+
+
 def _topic_sessions_enabled() -> bool:
     """Whether each Zulip topic should get its own conversation session.
 
@@ -704,7 +999,7 @@ def _topic_sessions_enabled() -> bool:
     This is opt-in because turning it on splits an existing stream's history
     into per-topic sessions, which changes what an agent remembers.
     """
-    return os.getenv("ZULIP_TOPIC_SESSIONS", "").strip().lower() in ("true", "1", "yes", "on")
+    return runtime_scope.get_setting("ZULIP_TOPIC_SESSIONS", "").strip().lower() in ("true", "1", "yes", "on")
 
 
 def _safe_delete_temp_file(file_path: str) -> None:
@@ -741,9 +1036,9 @@ class ZulipAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("zulip"))
         extra = config.extra or {}
 
-        self.api_key = os.getenv("ZULIP_API_KEY") or extra.get("api_key", "")
-        self.email = os.getenv("ZULIP_EMAIL") or extra.get("email", "")
-        self.site = os.getenv("ZULIP_SITE") or extra.get("site", "")
+        self.api_key = runtime_scope.get_setting("ZULIP_API_KEY") or extra.get("api_key", "")
+        self.email = runtime_scope.get_setting("ZULIP_EMAIL") or extra.get("email", "")
+        self.site = runtime_scope.get_setting("ZULIP_SITE") or extra.get("site", "")
 
         # Outbound secret guard (Issue #136): the platform extra is walked for
         # credential-shaped keys, and the adapter's own api_key is registered
@@ -754,6 +1049,11 @@ class ZulipAdapter(BasePlatformAdapter):
         # Populated on connect. Zulip renders mentions from the display name,
         # not the email local-part, so mention matching needs it.
         self.bot_full_name = ""
+        # The bot's own Zulip user id, learned on connect. Together with the
+        # email it is how the bot's own messages are recognised on every
+        # inbound path (issue #152), and how reaction-trigger targets are
+        # recognised (epic #149).
+        self._bot_user_id = ""
 
         # Validate site URL before creating client: https-only unless the
         # operator opted in, so the API key cannot leave in cleartext by
@@ -799,16 +1099,27 @@ class ZulipAdapter(BasePlatformAdapter):
         self._last_message_time: dict[str, float] = {}   # chat_id → last message epoch
         # DM session rotation: prevents context bloat in long conversations
         self._dm_session_turn_limit = int(
-            os.getenv("ZULIP_DM_SESSION_TURN_LIMIT", "20").strip()
+            runtime_scope.get_setting("ZULIP_DM_SESSION_TURN_LIMIT", "20").strip()
         )
         self._dm_base_message_counts: dict[str, int] = {}  # base_session_key → turn count
 
         # Block streaming config (Issue #49 — requires gateway-level streaming support)
         self._block_streaming = (
-            os.getenv("ZULIP_BLOCK_STREAMING", "").strip().lower() in ("true", "1", "yes", "on")
+            runtime_scope.get_setting("ZULIP_BLOCK_STREAMING", "").strip().lower() in ("true", "1", "yes", "on")
         )
 
-        self._data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
+        self._data_dir = runtime_scope.get_profile_data_dir()
+
+        # Persisted sender display names (issue #152). Zulip events do not
+        # always carry a usable name; the cache resolves one without an API
+        # call on every message. A missing or corrupt file is non-fatal.
+        self._display_names = DisplayNameCache(self._data_dir)
+
+        # Per-work-item delivery state for the audit trail (issue #145): the
+        # key is the same chat+topic route the activity trace uses, and the
+        # value records whether a send was attempted. Popped on completion, so
+        # it cannot grow for a run the gateway never finalizes.
+        self._audit_turns: dict[str, bool] = {}
 
         # Timeout configuration (Issue #62)
         self._connect_timeout, self._read_timeout, self._send_timeout = _resolve_timeouts()
@@ -825,10 +1136,23 @@ class ZulipAdapter(BasePlatformAdapter):
         # Response prefix (Issue #65) — prepended to every outbound message
         self._response_prefix = _resolve_response_prefix()
 
+        # Soft gate + observe group (issue #153). Both off by default: with
+        # neither set, this adapter behaves exactly as it did before the flags
+        # existed. The observed buffer is in-adapter (not host session) state.
+        self._soft_gate = _resolve_soft_gate()
+        self._observe_group = _resolve_observe_group()
+        self._observed_context = ObservedContextBuffer()
+
+        # Bounded history-aware context (issue #148). "off" adds no round-trip.
+        self._history_mode = _resolve_history_mode()
+        self._history_max_messages = _resolve_int_setting("ZULIP_HISTORY_MAX_MESSAGES", 8)
+        self._history_window_hours = _resolve_int_setting("ZULIP_HISTORY_WINDOW_HOURS", 72)
+        self._history_max_chars = _resolve_int_setting("ZULIP_HISTORY_MAX_CHARS", 4000)
+
         # Rate limiter (per-sender, sliding window)
         self._rate_limiter = RateLimiter(
             max_per_minute=int(
-                os.getenv("ZULIP_MAX_MESSAGES_PER_MINUTE", "60").strip()
+                runtime_scope.get_setting("ZULIP_MAX_MESSAGES_PER_MINUTE", "60").strip()
             ),
         )
 
@@ -868,16 +1192,31 @@ class ZulipAdapter(BasePlatformAdapter):
         # Reaction config
         self._reaction_cfg = ReactionConfig.from_env()
 
+        # In-channel action triggers (epic #149): a configured reaction on the
+        # bot's own message dispatches a turn for that topic. Off by default —
+        # when off, the "reaction" event type is not requested at all.
+        self._reaction_trigger_cfg = ReactionTriggerConfig.from_env()
+
         # Extra Zulip event types beyond "message" that this install needs.
-        # Features opt in here (e.g. reaction triggers need "reaction"); it is
-        # consulted when registering the event queue and when deciding whether
-        # a persisted queue can be reused. (Issue #162)
-        self._extra_event_types: list = []
+        # Features opt in here (reaction triggers need "reaction"; stable
+        # topic sessions need "update_message"/"delete_message"); it is
+        # consulted when registering the event queue and when deciding
+        # whether a persisted queue can be reused. (Issues #162, #163)
+        self._extra_event_types: list = (
+            ["reaction"] if self._reaction_trigger_cfg.enabled else []
+        )
         if _topic_sessions_enabled():
             # Stable topic sessions need rename and topic-deletion events;
             # opt in so a persisted queue whose subscription predates this
             # set is re-registered (issue #162 machinery).
             self._extra_event_types.extend(["update_message", "delete_message"])
+
+        # Sticky topic engagement (issues #165/#166): after a mention in a
+        # stream topic, follow-ups there are answered without a fresh mention
+        # until the idle TTL lapses or the caller stops. Off by default.
+        self._engagement_cfg = EngagementConfig.from_env()
+        self._engagement_store = TopicEngagementStore(self._engagement_cfg)
+        self._engagement_task: Optional[asyncio.Task] = None
 
         # DM policy engine (Issue #48 — controls who can DM the bot)
         self._policy = PolicyEngine(data_dir=self._data_dir)
@@ -901,6 +1240,26 @@ class ZulipAdapter(BasePlatformAdapter):
             logger.warning(
                 "ZULIP_ACTIVITY_TRACE is enabled but this gateway does not expose "
                 "the processing lifecycle hooks; the trace will not run"
+            )
+
+        # Per-session message queue (issue #151). Off by default. The queue
+        # learns that a run ended from on_processing_complete, so on a gateway
+        # without the lifecycle hooks it could only ever queue — stalling every
+        # message behind the first. There it does nothing at all: behaviour is
+        # then exactly what it was before the flag existed.
+        self._queue_cfg = SessionQueueConfig(
+            enabled=_resolve_session_queue(),
+            cap=_resolve_int_setting("ZULIP_QUEUE_CAP", DEFAULT_QUEUE_CAP),
+        )
+        self._session_queue = (
+            SessionQueue(self._queue_cfg)
+            if self._queue_cfg.enabled and ProcessingOutcome is not None
+            else None
+        )
+        if self._queue_cfg.enabled and ProcessingOutcome is None:
+            logger.warning(
+                "ZULIP_SESSION_QUEUE is enabled but this gateway does not expose "
+                "the processing lifecycle hooks; messages will not be queued"
             )
 
     async def _sdk_call(self, fn, *args, timeout: float, **kwargs):
@@ -1317,19 +1676,39 @@ class ZulipAdapter(BasePlatformAdapter):
         if key in self._traces:
             return  # already tracing this work item
 
+        title = "Working"
+        if isinstance(metadata, dict) and metadata.get("trace_title"):
+            title = str(metadata["trace_title"])
+
         async def post(content: str) -> Optional[int]:
             payload = self._trace_payload(chat_id, metadata, content)
             if payload is None:
                 return None
-            result = await self._sdk_call(
-                self.client.send_message, payload, timeout=self._send_timeout
-            )
+            # A trace message is an outbound send like any other, so it records
+            # the same delivery outcome (issue #145).
+            topic = _metadata_topic(metadata)
+            try:
+                result = await self._sdk_call(
+                    self.client.send_message, payload, timeout=self._send_timeout
+                )
+            except Exception:
+                await self._audit_logger.log_deliver_failed(
+                    "send_exception", chat_id=chat_id, topic=topic
+                )
+                raise
             if not isinstance(result, dict) or result.get("result") != "success":
+                await self._audit_logger.log_deliver_failed(
+                    "api_error", chat_id=chat_id, topic=topic
+                )
                 return None
             try:
-                return int(result.get("id"))
+                message_id = int(result.get("id"))
             except (TypeError, ValueError):
                 return None
+            await self._audit_logger.log_deliver_payload(
+                chat_id=chat_id, topic=topic, message_id=str(message_id)
+            )
+            return message_id
 
         async def edit(message_id: int, content: str) -> bool:
             result = await self._sdk_call(
@@ -1339,7 +1718,7 @@ class ZulipAdapter(BasePlatformAdapter):
             )
             return isinstance(result, dict) and result.get("result") == "success"
 
-        trace = ActivityTrace(post, edit, self._trace_cfg)
+        trace = ActivityTrace(post, edit, self._trace_cfg, title=title)
         self._traces[key] = trace
         self._trace_started[key] = time.monotonic()
         for alias in self._session_aliases(event):
@@ -1421,7 +1800,32 @@ class ZulipAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Gateway lifecycle hook: a work item started. (epic #139 / #158)"""
+        await self._audit_dispatch_turn(event)
         self._start_trace(event)
+        if self._session_queue is not None:
+            self._session_queue.mark_active(self._queue_session_key(event))
+
+    async def _audit_dispatch_turn(self, event: MessageEvent) -> None:
+        """Record a dispatched turn and arm this work item for its outcome.
+
+        Pairs with the ``deliver_*`` events so "the run produced nothing" is
+        distinguishable from "the run never started" (issue #145).
+        """
+        chat_id, metadata = _event_route(event)
+        if not chat_id:
+            return
+        self._audit_turns[self._trace_key(chat_id, metadata)] = False
+        await self._audit_logger.log_dispatch_turn(
+            chat_id=chat_id,
+            topic=_metadata_topic(metadata),
+            message_id=getattr(event, "message_id", None),
+        )
+
+    def _note_delivery_attempt(self, chat_id: str, metadata: Any) -> None:
+        """Mark this work item as having produced something to deliver."""
+        key = self._trace_key(chat_id, metadata)
+        if key in self._audit_turns:
+            self._audit_turns[key] = True
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: Any = None
@@ -1432,7 +1836,176 @@ class ZulipAdapter(BasePlatformAdapter):
         error and abort distinguishable at all — and therefore what lets a run
         that produced nothing say so instead of staying silent.
         """
+        await self._audit_run_end(event)
         await self._finish_trace(event, outcome)
+        # Last, so the finished run's status is closed out before the next
+        # queued turn for the same session starts (issue #151).
+        await self._drain_session_queue(event)
+
+    async def _audit_run_end(self, event: MessageEvent) -> None:
+        """Record ``deliver_empty`` for a dispatched run that never sent.
+
+        Only reached when ``on_processing_start`` armed this work item: a run
+        the gateway never dispatched has no entry and writes nothing.
+        """
+        chat_id, metadata = _event_route(event)
+        if not chat_id:
+            return
+        key = self._trace_key(chat_id, metadata)
+        attempted = self._audit_turns.pop(key, None)
+        if attempted is False:
+            await self._audit_logger.log_deliver_empty(
+                chat_id=chat_id, topic=_metadata_topic(metadata)
+            )
+
+    # --- per-session message queue (issue #151) ---
+
+    def _queue_session_key(self, event: Any) -> str:
+        """Session identity for the queue.
+
+        The host's own session key when it exposes one, so the queue agrees with
+        the host about what a session is; otherwise the chat+topic route, the
+        same pair the activity trace keys on (and the same reasoning: a second
+        derivation would drift). Never one global key — two topics in a stream,
+        and two DMs, must not serialize against each other.
+        """
+        key = self._session_key_for_event(event)
+        if key:
+            return key
+        chat_id, metadata = _event_route(event)
+        return f"route:{chat_id}\x00{_metadata_topic(metadata) or ''}"
+
+    async def _audit_queue_transition(
+        self, event_type: str, event: Any, message_id: Any, depth: int
+    ) -> None:
+        """Audit one queue transition: identifiers and depth, never a body.
+
+        The ⏳ reaction is transient by design, so this file is what proves the
+        queue engaged and how deep it got.
+        """
+        chat_id, _ = _event_route(event)
+        await self._audit_logger.log_event(
+            event_type,
+            {
+                "chat_id": chat_id,
+                "message_id": None if message_id is None else str(message_id),
+                "depth": depth,
+            },
+        )
+
+    async def _queue_turn(
+        self, event: Any, reactions: Any, typing_params: Any, message_id: Any
+    ) -> bool:
+        """Queue a fully cleared turn when its session is mid-run.
+
+        True when the turn was queued and must not be dispatched now. Called
+        after every gate above, so a queued turn re-enters only the dispatch
+        path — waiting can never change what the bot is allowed to answer.
+        """
+        key = self._queue_session_key(event)
+        if not key or not self._session_queue.is_active(key):
+            return False
+        accepted, depth = self._session_queue.enqueue(
+            key,
+            PendingTurn(
+                event=event,
+                reactions=reactions,
+                typing_params=typing_params,
+                message_id=message_id,
+            ),
+        )
+        if not accepted:
+            # Full: dispatch now rather than drop. The cap bounds the wait, not
+            # the delivery, and this turn has already cleared every gate.
+            await self._audit_queue_transition(
+                "session_queue_overflow", event, message_id, depth
+            )
+            logger.warning(
+                "zulip session queue full [key=%s msg=%s depth=%d]; "
+                "dispatching immediately",
+                mask_pii(key),
+                mask_pii(str(message_id)),
+                depth,
+            )
+            return False
+        await reactions.queued()
+        await self._audit_queue_transition(
+            "session_queue_enqueue", event, message_id, depth
+        )
+        logger.info(
+            "zulip session queued [key=%s msg=%s depth=%d]",
+            mask_pii(key),
+            mask_pii(str(message_id)),
+            depth,
+        )
+        return True
+
+    async def _drain_session_queue(self, event: Any) -> None:
+        """Dispatch the oldest turn waiting behind the session that just ended.
+
+        One at a time, in arrival order. The session stays marked active while
+        the dispatched turn runs, so a message arriving before the host's start
+        hook for it still queues instead of steering it. Never raises: this runs
+        inside ``on_processing_complete``, which must not reach the gateway loop.
+        """
+        if self._session_queue is None:
+            return
+        key = self._queue_session_key(event)
+        if not key:
+            return
+        while True:
+            turn = self._session_queue.dequeue(key)
+            if turn is None:
+                self._session_queue.release(key)
+                return
+            self._session_queue.mark_active(key)
+            await self._audit_queue_transition(
+                "session_queue_dequeue",
+                turn.event,
+                turn.message_id,
+                self._session_queue.depth(key),
+            )
+            await turn.reactions.unqueued()
+            try:
+                await self._dispatch_turn(
+                    turn.event, turn.reactions, turn.typing_params, turn.message_id
+                )
+            except Exception as e:
+                # The turn never reached a run, so its session is free again:
+                # give the next waiting turn its chance instead of wedging the
+                # queue behind a dispatch that cannot start.
+                logger.warning(
+                    "zulip session queue dispatch failed [key=%s msg=%s]: %s",
+                    mask_pii(key),
+                    mask_pii(str(turn.message_id)),
+                    mask_pii(str(e)),
+                )
+                self._session_queue.release(key)
+                continue
+            return
+
+    async def _dispatch_turn(
+        self, event: Any, reactions: Any, typing_params: Any, message_id: Any
+    ) -> None:
+        """Hand one cleared turn to the gateway and finish its reaction state.
+
+        Shared by the immediate path and the queue's drain path, so a queued
+        turn gets identical error / read / success treatment to one dispatched
+        on arrival (issue #151).
+        """
+        try:
+            await self.handle_message(event)
+        except Exception:
+            await reactions.error()
+            await self._stop_typing(typing_params)
+            raise
+        finally:
+            await self._mark_read(message_id)
+
+        # Only reached on success. The core stops typing itself via the
+        # stop_typing() hook when the agent run finishes; mark the success
+        # reaction here.
+        await reactions.success()
 
     async def _mark_read(self, message_id: Any) -> None:
         """Mark a message as read. Best-effort."""
@@ -1555,6 +2128,13 @@ class ZulipAdapter(BasePlatformAdapter):
         # Start presence heartbeat so bot appears online
         self._presence_task = asyncio.create_task(self._presence_heartbeat())
 
+        # Sticky engagement expiry scanner (#166). Started only when engagement
+        # is enabled, so mode=off runs no background task at all.
+        if self._engagement_cfg.mode != ENGAGEMENT_MODE_OFF:
+            self._engagement_task = asyncio.create_task(
+                self._engagement_expiry_loop()
+            )
+
         # Check for plugin updates on startup
         updater.startup_version_check(__version__, __repo__)
 
@@ -1563,6 +2143,12 @@ class ZulipAdapter(BasePlatformAdapter):
 
         # Recover interrupted messages from previous gateway instance
         bot_user_id = str(probe_result.get("bot", {}).get("id", ""))
+        bot_user_id = str(probe_result.get("bot", {}).get("id", ""))
+        if bot_user_id:
+            self._bot_user_id = bot_user_id
+        # Warn about reaction-trigger blind spots: Zulip only delivers
+        # ``reaction`` events for streams the bot is subscribed to. (#164)
+        await self._check_reaction_trigger_subscriptions()
         asyncio.create_task(
             recover_interrupted_messages(
                 client=self.client,
@@ -1601,6 +2187,12 @@ class ZulipAdapter(BasePlatformAdapter):
             self._presence_task.cancel()
             try:
                 await self._presence_task
+            except asyncio.CancelledError:
+                pass
+        if self._engagement_task:
+            self._engagement_task.cancel()
+            try:
+                await self._engagement_task
             except asyncio.CancelledError:
                 pass
         self._mark_disconnected()
@@ -1673,6 +2265,116 @@ class ZulipAdapter(BasePlatformAdapter):
             except Exception:
                 pass  # presence is best-effort
             await asyncio.sleep(60)
+
+    def _engagement_notice_payload(
+        self, stream_id: object, topic: str, content: str
+    ) -> Optional[dict]:
+        """In-topic send payload for an engagement notice.
+
+        Resolved through ``_parse_target`` — the same routing the reply uses —
+        so a notice can never land in a different stream than the one it
+        describes.
+        """
+        try:
+            target = _parse_target(str(stream_id))
+        except (TypeError, ValueError):
+            return None
+        if target.get("type") != "stream":
+            return None
+        return {
+            "type": "stream",
+            "to": target["stream_id"],
+            "topic": topic,
+            "content": content,
+        }
+
+    async def _ack_engagement_stop(self, message: dict, *, cleared: bool) -> None:
+        """Acknowledge an explicit stop of sticky listening, in-topic."""
+        if cleared:
+            text_out = (
+                "Okay — I'll stop listening on this topic. "
+                "@mention me again when you want to continue."
+            )
+        else:
+            text_out = (
+                "I wasn't actively listening on this topic. "
+                "@mention me to start a conversation."
+            )
+        payload = self._engagement_notice_payload(
+            message.get("stream_id"), message.get("subject", ""), text_out
+        )
+        if payload is None:
+            return
+        try:
+            await self._sdk_call(
+                self.client.send_message, payload, timeout=self._send_timeout
+            )
+        except Exception as e:
+            logger.warning("zulip engagement stop ack failed: %s", mask_pii(str(e)))
+
+    async def _engagement_expiry_loop(self) -> None:
+        """Expire idle engagements and post an in-topic notice (#166).
+
+        Only natural idle TTL expiry notifies; an explicit stop or session end
+        clears silently. Runs only while the adapter is listening and only when
+        engagement is enabled — the task is simply never started for mode=off.
+        """
+        interval = self._engagement_cfg.expiry_scan_seconds
+        ttl_min = max(1, int(round(self._engagement_cfg.ttl_seconds / 60.0)))
+        logger.info(
+            "zulip engagement expiry scanner started [interval=%.0fs ttl=%sm]",
+            interval,
+            ttl_min,
+        )
+        while self._listening:
+            try:
+                await asyncio.sleep(interval)
+                if not self._listening:
+                    break
+                expired = self._engagement_store.pop_expired()
+                if not expired:
+                    continue
+
+                # Coalesce: one notice per (stream_id, topic).
+                by_topic: dict[tuple[str, str], list[EngagementEntry]] = {}
+                for entry in expired:
+                    by_topic.setdefault((entry.stream_id, entry.topic), []).append(
+                        entry
+                    )
+
+                if not self._engagement_cfg.expiry_notice:
+                    continue
+                for (stream_id, topic), entries in by_topic.items():
+                    payload = self._engagement_notice_payload(
+                        stream_id,
+                        topic,
+                        format_expiry_notice_text(ttl_minutes=ttl_min),
+                    )
+                    if payload is None:
+                        continue
+                    try:
+                        await self._sdk_call(
+                            self.client.send_message,
+                            payload,
+                            timeout=self._send_timeout,
+                        )
+                        logger.info(
+                            "zulip engagement expired notice [stream=%s topic=%s users=%d]",
+                            stream_id,
+                            topic,
+                            len(entries),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "zulip engagement expired notice failed [stream=%s topic=%s]: %s",
+                            stream_id,
+                            topic,
+                            mask_pii(str(e)),
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("zulip engagement expiry loop error: %s", str(e))
 
     async def _listen_for_events(self):
         """Listen for incoming Zulip messages via persistent event queue."""
@@ -1763,6 +2465,15 @@ class ZulipAdapter(BasePlatformAdapter):
                         asyncio.create_task(
                             self._handle_message_delete_event(event)
                         )
+                    elif event.get("type") == "reaction":
+                        # In-channel action triggers (epic #149). Fire-and-forget
+                        # like messages so a slow resolution/fetch cannot stall
+                        # the poll loop.
+                        had_message = True
+                        task = asyncio.create_task(
+                            self._handle_reaction_event(event)
+                        )
+                        processing_tasks.append(task)
 
                 # Fire-and-forget: don't await processing tasks here so the
                 # poll loop keeps fetching events. Errors are logged inside
@@ -2511,6 +3222,210 @@ class ZulipAdapter(BasePlatformAdapter):
             orphaned,
         )
 
+    def _is_self_message(self, message: dict) -> bool:
+        """Whether ``message`` was authored by this bot.
+
+        The event queue subscribes to all public streams, so the bot receives
+        its own sends back. Treating those as user input would let the bot
+        answer itself and would feed its own output back in as history, so the
+        check lives here and is applied on every inbound path (issue #152).
+        """
+        sender_email = str(message.get("sender_email") or "").strip()
+        if sender_email and self.email and sender_email.lower() == self.email.lower():
+            return True
+        sender_id = message.get("sender_id")
+        if self._bot_user_id and sender_id is not None:
+            return str(sender_id) == str(self._bot_user_id)
+        return False
+
+    async def _fetch_display_name(self, user_id: Any) -> Optional[str]:
+        """One bounded lookup for a display name, used on a cache miss (#152)."""
+        fn, args = _user_lookup_call(self.client, user_id)
+        if fn is None:
+            logger.warning(
+                "zulip display-name lookup unavailable: %s exposes no supported "
+                "user lookup (issue #196)",
+                type(self.client).__name__,
+            )
+            return None
+        try:
+            result = await self._sdk_call(fn, *args, timeout=self._send_timeout)
+        except Exception:
+            return None
+        if not isinstance(result, dict) or result.get("result") != "success":
+            return None
+        user = result.get("user") or {}
+        if isinstance(user, list):
+            # The SDK docstring shows a list shape for /users/{id}; tolerate it.
+            user = user[0] if user else {}
+        name = user.get("full_name") or ""
+        return name.strip() or None
+
+    async def _resolve_display_name(self, message: dict) -> str:
+        """Sender display name: the event payload, the cache, then one fetch.
+
+        Zulip's payload name is authoritative and refreshes the cache. When it
+        is missing, the persisted cache is consulted and, on a miss, refreshed
+        with a single bounded lookup rather than one call per message (#152).
+        """
+        provided = str(message.get("sender_full_name") or "").strip()
+        user_id = message.get("sender_id")
+        if provided:
+            if user_id is not None:
+                self._display_names.put(user_id, provided)
+            return provided
+        if user_id is None:
+            return "Unknown"
+        name = await self._display_names.get_or_fetch(
+            user_id, self._fetch_display_name
+        )
+        return name or "Unknown"
+
+    # ------------------------------------------------------------------
+    # Observed stream context and history harvest (#153, #148)
+    # ------------------------------------------------------------------
+
+    def _stream_monitored(self, stream_name: str) -> bool:
+        """Whether ``stream_name`` is inside ``ZULIP_STREAMS`` (all when unset)."""
+        if self._streams_filter is None:
+            return True
+        return stream_name.lower() in self._streams_filter
+
+    def _observe_stream_message(self, message: dict, content: str) -> None:
+        """Record a non-addressed stream message as topic context (#153).
+
+        No reply, no dispatch, no API call: the message joins a bounded
+        per-topic buffer that is prepended to the agent-facing text the next
+        time the bot is addressed in that topic. Self/bot messages are never
+        observed, and streams the bot does not monitor contribute nothing.
+        """
+        if not self._observe_group:
+            return
+        if message.get("type") != "stream":
+            return
+        if self._is_self_message(message):
+            return
+        stream_name = str(message.get("display_recipient") or "")
+        if not self._stream_monitored(stream_name):
+            return
+        text = strip_html_to_text(content or "").strip()
+        if not text:
+            return
+        sender = (
+            str(message.get("sender_full_name") or "").strip()
+            or str(message.get("sender_email") or "").strip()
+            or "Unknown"
+        )
+        topic = str(message.get("subject") or "")
+        self._observed_context.add(
+            message.get("stream_id"), topic, f"[{sender}] {text}"
+        )
+        logger.debug(
+            "zulip observed stream msg [stream=%s topic=%s]",
+            mask_pii(stream_name),
+            mask_pii(topic),
+        )
+
+    async def _quoted_topic_history(
+        self,
+        stream_name: str,
+        stream_id: Any,
+        topic: str,
+        *,
+        content: str,
+        addressed: bool,
+    ) -> str:
+        """Quoted context prepended to the agent-facing body for one turn.
+
+        Two independent sources: the observed-topic buffer (#153), which costs
+        nothing and only exists for a turn the bot was addressed in, and an
+        optional harvested slice of real topic history (#148). Both are
+        best-effort — a failed harvest is logged and dropped — and neither ever
+        reaches a slash command or a policy/rate-limit gate, which have already
+        been decided by the time this runs.
+        """
+        # Slash commands belong to the gateway — never spend a harvest on them
+        # and never modify their body (#148, #190).
+        if is_command(content):
+            return ""
+
+        blocks: list[str] = []
+
+        if self._observe_group and addressed:
+            observed = self._observed_context.render(stream_id, topic)
+            if observed:
+                blocks.append(f"{OBSERVED_HISTORY_LABEL}\n{observed}")
+
+        if self._history_mode != "off" and (
+            self._history_mode == "always" or _history_intent_matches(content)
+        ):
+            harvested = await self._harvest_history_block(stream_name, topic)
+            if harvested:
+                blocks.append(f"{FETCHED_HISTORY_LABEL}\n{harvested}")
+
+        if not blocks:
+            return ""
+        return "\n\n".join(blocks) + "\n\n"
+
+    async def _fetch_stream_history(self, stream_name: str, topic: str) -> list[dict]:
+        """Narrow ``[stream, topic]`` fetch of the newest topic messages (#148).
+
+        The synchronous SDK call runs through ``_sdk_call`` so it is bounded
+        and cannot block the event loop. A non-success response yields an empty
+        list rather than an error.
+        """
+        narrow = [{"operator": "stream", "operand": stream_name}]
+        if topic:
+            narrow.append({"operator": "topic", "operand": topic})
+        result = await self._sdk_call(
+            self.client.get_messages,
+            {
+                "anchor": "newest",
+                "num_before": self._history_max_messages,
+                "num_after": 0,
+                "narrow": narrow,
+            },
+            timeout=HISTORY_FETCH_TIMEOUT,
+        )
+        if not isinstance(result, dict) or result.get("result") != "success":
+            return []
+        messages = result.get("messages")
+        return messages if isinstance(messages, list) else []
+
+    async def _harvest_history_block(self, stream_name: str, topic: str) -> str:
+        """Best-effort quoted slice of the real topic history (#148).
+
+        Streams/topics only — DMs have their own per-user sessions and are
+        never harvested across. Any error response or timeout is logged and
+        dropped, so a slow or failing Zulip API can never fail or unboundedly
+        delay a dispatch.
+        """
+        try:
+            messages = await asyncio.wait_for(
+                self._fetch_stream_history(stream_name, topic),
+                timeout=HISTORY_FETCH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "zulip history harvest timed out (dropped) [stream=%s topic=%s]",
+                mask_pii(stream_name),
+                mask_pii(topic),
+            )
+            return ""
+        except Exception as e:
+            logger.warning(
+                "zulip history harvest failed (dropped): %s", mask_pii(str(e))
+            )
+            return ""
+        if not messages:
+            return ""
+        return _render_history_block(
+            messages,
+            max_messages=self._history_max_messages,
+            window_hours=self._history_window_hours,
+            max_chars=self._history_max_chars,
+        )
+
     async def _handle_message(self, message: dict):
         """Process incoming Zulip message."""
         message_id = message.get("id")
@@ -2524,13 +3439,18 @@ class ZulipAdapter(BasePlatformAdapter):
         )
 
         # Filter self-messages to prevent loops
-        if message.get("sender_email") == self.email:
+        if self._is_self_message(message):
             return
 
         msg_type = message.get("type")  # "stream" or "private"
         content = message.get("content", "")
         sender_email = message.get("sender_email", "")
-        sender_full_name = message.get("sender_full_name", "Unknown")
+        # Cheap payload name for the early gating/engagement paths; the
+        # authoritative name is resolved (and cached/refreshed) after the drop
+        # paths below, so a discarded message never costs a lookup (#152).
+        sender_full_name = (
+            str(message.get("sender_full_name") or "").strip() or "Unknown"
+        )
 
         # --- Rate limiting (per-sender) ---
         sender_key = sender_email or str(message.get("sender_id", ""))
@@ -2549,6 +3469,11 @@ class ZulipAdapter(BasePlatformAdapter):
         # Strip Zulip @-mention syntax and HTML
         content = strip_html_to_text(content)
 
+        # Whether the bot was actually named (or an onchar prefix fired). Only
+        # meaningful for stream messages; carried into event metadata under the
+        # soft gate (issue #153).
+        addressed = False
+
         # --- Reactions ---
         # Constructed here so the error path below can reach it, but not
         # started until the message has cleared every drop path. See the
@@ -2564,6 +3489,10 @@ class ZulipAdapter(BasePlatformAdapter):
             # malformed event would otherwise raise AttributeError inside the
             # handler rather than being skipped.
             stream_name = str(message.get("display_recipient", ""))
+            # Engagement keys on the stream + topic pair, read here so the gate
+            # below never depends on locals bound later in the handler.
+            gate_stream_id = message.get("stream_id")
+            gate_topic = message.get("subject", "")
             chatmode, onchar_prefixes, require_mention = _resolve_chatmode(stream_name)
 
             # Check onchar trigger
@@ -2590,19 +3519,68 @@ class ZulipAdapter(BasePlatformAdapter):
                 was_mentioned = bool(mention_regex.search(content))
 
             # Apply gating
+            #
+            # A synthetic reaction-trigger turn (epic #149) already carries an
+            # explicit human instruction, so it does not need a fresh @mention.
+            # It still flows through the per-sender rate limit, stream filter
+            # and group policy below — the reaction is a trigger, never an
+            # authorisation bypass.
+            is_reaction_trigger = bool(message.get("_reaction_trigger"))
+            # ``addressed`` is the honest mention signal — the bot was named or
+            # an onchar prefix fired — independent of which mode decided to
+            # dispatch. ``ZULIP_SOFT_GATE`` dispatches every monitored stream
+            # message like onmessage but keeps that distinction in metadata so
+            # the agent can watch a stream it was not spoken to (issue #153).
             should_process = False
-            if chatmode == "onmessage":
+            addressed = was_mentioned or onchar_triggered
+            if is_reaction_trigger:
+                should_process = True
+            elif self._soft_gate:
+                should_process = True
+            elif chatmode == "onmessage":
                 should_process = True
             elif chatmode == "oncall":
                 should_process = was_mentioned
             elif chatmode == "onchar":
                 should_process = onchar_triggered or was_mentioned
 
-            # requireMention acts as additional gate (ignored in onmessage mode)
-            if chatmode != "onmessage" and require_mention and not was_mentioned and not onchar_triggered:
+            # requireMention acts as additional gate (ignored in onmessage mode
+            # and under the soft gate, which exists to dispatch everything).
+            if (
+                not is_reaction_trigger
+                and not self._soft_gate
+                and chatmode != "onmessage"
+                and require_mention
+                and not was_mentioned
+                and not onchar_triggered
+            ):
                 should_process = False
 
+            # Sticky topic engagement (#165/#166): once a user (or the whole
+            # topic, per scope) has engaged the bot with a real mention/onchar,
+            # later messages in that same topic are accepted without a fresh
+            # mention until the idle TTL lapses. DMs never reach this block and
+            # onmessage streams already answer everything, so engagement is
+            # only consulted for mention-gated modes. An engaged follow-up
+            # still passes stream filtering, group policy and the per-sender
+            # rate limit below exactly like any other message.
+            engaged_followup = False
+            if (
+                self._engagement_cfg.mode != ENGAGEMENT_MODE_OFF
+                and chatmode != "onmessage"
+                and not should_process
+                and self._engagement_store.is_engaged(
+                    gate_stream_id, gate_topic, sender_email
+                )
+            ):
+                engaged_followup = True
+                should_process = True
+
             if not should_process:
+                # Not addressed and not dispatched: keep it as topic context
+                # without ever replying (issue #153).
+                if msg_type == "stream" and self._observe_group and not addressed:
+                    self._observe_stream_message(message, content)
                 logger.debug("zulip drop [mode=%s, no trigger] msg=%s", chatmode, mask_pii(str(message_id)))
                 return
 
@@ -2662,6 +3640,51 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
                 return
 
+            # --- Sticky engagement: explicit stop / session end (#166) ---
+            # This sits inside the stream gate — after filtering and group
+            # policy, so an unauthorized or off-topic sender can never use it —
+            # and before the ``is_command`` interception below. "/unlisten" and
+            # "/reset" start with "/" yet are not registered admin commands,
+            # so without this they would fall through to an agent turn. A stop
+            # is acknowledged in-topic and consumes the message.
+            engagement_blocked = False
+            if (
+                self._engagement_cfg.mode != ENGAGEMENT_MODE_OFF
+                and chatmode != "onmessage"
+            ):
+                if is_stop_listening_message(content):
+                    cleared = self._engagement_store.clear(
+                        gate_stream_id, gate_topic, sender_email
+                    )
+                    await self._ack_engagement_stop(message, cleared=cleared)
+                    await self._mark_read(message_id)
+                    return
+                if is_end_session_message(content):
+                    # A session ender clears the topic and must not re-open it
+                    # via the engaged_followup path below.
+                    self._engagement_store.clear(
+                        gate_stream_id, gate_topic, sender_email
+                    )
+                    engagement_blocked = True
+
+            # --- Sticky engagement: open / refresh (#165/#166) ---
+            # Only a message that actually reaches the agent — a real
+            # mention/onchar, or a follow-up on an already-engaged topic —
+            # (re)starts the idle TTL. Keeping onmessage streams out avoids
+            # expiry notices for topics that never needed a mention.
+            if (
+                self._engagement_cfg.mode != ENGAGEMENT_MODE_OFF
+                and chatmode != "onmessage"
+                and not engagement_blocked
+                and (was_mentioned or onchar_triggered or engaged_followup)
+            ):
+                self._engagement_store.mark_engaged(
+                    gate_stream_id,
+                    gate_topic,
+                    sender_email,
+                    user_name=sender_full_name,
+                )
+
             # Normalize mention from content
             if was_mentioned and mention_regex:
                 if mention_regex.search(content):
@@ -2694,10 +3717,14 @@ class ZulipAdapter(BasePlatformAdapter):
         # safe no-ops.
         typing_params = None
 
+        # Resolve the sender's display name once, after the drop paths above so
+        # a discarded message never costs a lookup. The event payload wins; a
+        # miss refreshes the persisted cache with one bounded fetch (#152).
+        sender_full_name = await self._resolve_display_name(message)
+
         # --- Command interception (before AI dispatch) ---
         if is_command(content):
             sender_email = message.get("sender_email", "")
-            sender_full_name = message.get("sender_full_name", "")
             # Determine chat_id early for command replies
             if msg_type == "stream":
                 cmd_chat_id = str(message.get("stream_id", ""))
@@ -2771,6 +3798,11 @@ class ZulipAdapter(BasePlatformAdapter):
         # --- DM policy check (Issue #48) ---
         if msg_type == "private":
             sender_email = message.get("sender_email", "")
+            # Approval happens out of process (``python3 -m zulip.pairing``), so
+            # pick up a rewritten allowlist before deciding (issue #198). This
+            # is one stat() on the data file, and it also makes a revocation
+            # take effect without a restart.
+            self._policy.refresh_if_changed()
             allowed, pairing_code = self._policy.check_dm(sender_email)
             if not allowed:
                 await self._audit_logger.log_policy_block(
@@ -2783,7 +3815,9 @@ class ZulipAdapter(BasePlatformAdapter):
                     reply = (
                         f"👋 Hi! You need to be approved before messaging this bot.\n\n"
                         f"Your pairing code: **PAIR-{pairing_code}**\n\n"
-                        f"Share this code with your admin to get access."
+                        f"Share this code with your admin to get access. They can\n"
+                        f"approve it with:\n"
+                        f"`python3 -m zulip.pairing approve PAIR-{pairing_code}`"
                     )
                 elif self._policy.mode == "disabled":
                     reply = "🚫 DMs to this bot are currently disabled."
@@ -2850,6 +3884,18 @@ class ZulipAdapter(BasePlatformAdapter):
                 # per-stream session (unreachable for well-formed events).
             source = self.build_source(**source_kwargs)
             extra_meta = {"topic": topic, "stream_id": stream_id}
+            if message.get("_reaction_trigger"):
+                # Label the triggered run legibly instead of echoing the
+                # internal envelope into the room. (#164)
+                extra_meta["reaction_trigger"] = True
+                extra_meta["trace_title"] = (
+                    f"reaction :{message.get('_reaction_emoji', '?')}: — "
+                    f"{message.get('_reaction_instruction', 'triggered')}"
+                )
+            if self._soft_gate:
+                # Only added under the soft gate, so with the flag off the event
+                # metadata is byte-identical to before (issue #153).
+                extra_meta["addressed"] = addressed
         else:
             sender_id = message.get("sender_id")
             chat_id = _private_chat_id(message)
@@ -2900,6 +3946,24 @@ class ZulipAdapter(BasePlatformAdapter):
             "topic_changed": topic_changed,
         })
 
+        # --- Quoted topic history (issues #153, #148) ---
+        #
+        # Appended to the agent-facing body only. Slash commands were handled
+        # and returned above, and every policy/rate-limit gate has already
+        # decided this turn, so quoted context can never change what the bot is
+        # allowed to answer or cost a round-trip on a message that is dropped.
+        # DMs are never harvested: their sessions are per-user and isolated.
+        if msg_type == "stream":
+            quoted = await self._quoted_topic_history(
+                stream_name,
+                stream_id,
+                topic,
+                content=content,
+                addressed=addressed,
+            )
+            if quoted:
+                content = quoted + content
+
         event = MessageEvent(
             text=content,
             message_type=MessageType.TEXT,
@@ -2908,19 +3972,221 @@ class ZulipAdapter(BasePlatformAdapter):
             metadata=extra_meta,
         )
 
-        try:
-            await self.handle_message(event)
-        except Exception:
-            await reactions.error()
-            await self._stop_typing(typing_params)
-            raise
-        finally:
-            await self._mark_read(message_id)
+        # --- Per-session queue (issue #151) ---
+        #
+        # Deliberately last: the turn has already been rate limited, cleared
+        # stream gating, stream filtering, group and DM policy, and had any
+        # command intercepted, so waiting for its session cannot change what
+        # the bot is allowed to answer.
+        if self._session_queue is not None and await self._queue_turn(
+            event, reactions, typing_params, message_id
+        ):
+            return
 
-        # Only reached on success. The core stops typing itself via the
-        # stop_typing() hook when the agent run finishes; mark the success
-        # reaction here.
-        await reactions.success()
+        await self._dispatch_turn(event, reactions, typing_params, message_id)
+
+    async def _resolve_reaction_user(self, user_id: str):
+        """Resolve the reacting user's email (a reaction event carries no user
+        object). Returns ``(email, full_name)``; email is ``None`` on failure."""
+        user = await self.get_user_info(user_id)
+        if user and user.get("email"):
+            return user["email"], (user.get("full_name") or "")
+        return None, None
+
+    async def _fetch_message(self, message_id: str) -> Optional[dict]:
+        """Fetch a single Zulip message by id, bounded and best-effort."""
+        try:
+            mid = self._validate_message_id(message_id)
+        except ValueError:
+            return None
+        try:
+            result = await self._sdk_call(
+                self.client.get_raw_message, mid, timeout=self._read_timeout
+            )
+        except Exception as e:
+            logger.warning(
+                "zulip reaction trigger: message fetch failed [id=%s error=%s]",
+                mask_pii(message_id),
+                mask_pii(str(e)),
+            )
+            return None
+        if isinstance(result, dict) and result.get("result") == "success":
+            message = result.get("message")
+            if isinstance(message, dict):
+                return message
+        return None
+
+    async def _handle_reaction_event(self, event: dict) -> None:
+        """Turn a configured reaction on the bot's own message into a turn.
+
+        The synthetic turn carries the *reacting human* as its sender, so
+        every authorisation and rate-limit decision is made about them. A
+        reaction is never an authorisation bypass. (Epic #149 / #163)
+        """
+        matched = match_reaction_trigger(event, self._reaction_trigger_cfg)
+        if not matched:
+            return
+        try:
+            dedupe_key = reaction_dedupe_key(
+                matched.message_id, matched.emoji, matched.user_id
+            )
+            if self._dedupe.check(dedupe_key):
+                logger.debug(
+                    "zulip reaction trigger dedupe hit [msg=%s emoji=%s]",
+                    mask_pii(matched.message_id),
+                    matched.emoji,
+                )
+                return
+
+            user_email, user_name = await self._resolve_reaction_user(
+                matched.user_id
+            )
+            if not user_email:
+                # Fail closed *and say so*: dispatching without an authorizable
+                # sender would only produce a silent policy drop. (#164)
+                logger.warning(
+                    "zulip reaction trigger dropped: could not resolve the "
+                    "reacting user's email [user_id=%s msg=%s emoji=%s]",
+                    mask_pii(matched.user_id),
+                    mask_pii(matched.message_id),
+                    matched.emoji,
+                )
+                await self._audit_logger.log_event(
+                    "reaction_trigger_dropped",
+                    {
+                        "message_id": matched.message_id,
+                        "emoji": matched.emoji,
+                        "user_id": matched.user_id,
+                        "reason": "unresolved_sender",
+                    },
+                )
+                return
+
+            target = await self._fetch_message(matched.message_id)
+            if not is_eligible_target_message(
+                target,
+                any_message=self._reaction_trigger_cfg.any_message,
+                bot_user_id=getattr(self, "_bot_user_id", ""),
+                bot_email=self.email or "",
+            ):
+                logger.info(
+                    "zulip reaction trigger ignored: ineligible target "
+                    "[msg=%s emoji=%s]",
+                    mask_pii(matched.message_id),
+                    matched.emoji,
+                )
+                return
+
+            stream_name = str(target.get("display_recipient") or "").strip()
+            if not stream_name:
+                logger.info(
+                    "zulip reaction trigger ignored: no stream name [msg=%s]",
+                    mask_pii(matched.message_id),
+                )
+                return
+            if (
+                self._streams_filter is not None
+                and stream_name.lower() not in self._streams_filter
+            ):
+                logger.info(
+                    "zulip reaction trigger ignored: stream not monitored "
+                    "[stream=%s]",
+                    mask_pii(stream_name),
+                )
+                return
+            topic = str(target.get("subject") or "").strip() or "general"
+
+            logger.info(
+                "zulip reaction trigger fired [msg=%s emoji=%s sender=%s "
+                "stream=%s topic=%s]",
+                mask_pii(matched.message_id),
+                matched.emoji,
+                mask_pii(user_email),
+                mask_pii(stream_name),
+                mask_pii(topic),
+            )
+            await self._audit_logger.log_event(
+                "reaction_trigger",
+                {
+                    "message_id": matched.message_id,
+                    "emoji": matched.emoji,
+                    "sender_id": user_email,
+                    "stream": stream_name,
+                    "topic": topic,
+                },
+            )
+
+            synthetic = build_reaction_trigger_message(
+                target,
+                matched,
+                stream_name,
+                topic,
+                user_email=user_email,
+                user_name=user_name,
+            )
+            await self._handle_message(synthetic)
+        except Exception as e:
+            logger.error(
+                "zulip reaction trigger failed [msg=%s error=%s]",
+                mask_pii(matched.message_id),
+                mask_pii(str(e)),
+            )
+
+    async def _check_reaction_trigger_subscriptions(self) -> None:
+        """Warn about monitored streams the bot is not subscribed to (#164).
+
+        Zulip only delivers ``reaction`` events for streams the user is
+        subscribed to, while ``message`` events arrive anyway, so an
+        unsubscribed monitored stream looks healthy while the trigger silently
+        never fires.
+        """
+        if not self._reaction_trigger_cfg.enabled:
+            return
+        try:
+            result = await self._sdk_call(
+                self.client.get_subscriptions, {}, timeout=self._read_timeout
+            )
+        except Exception as e:
+            logger.warning(
+                "zulip reaction trigger subscription check failed: %s",
+                mask_pii(str(e)),
+            )
+            return
+        subscriptions = (
+            result.get("subscriptions", []) if isinstance(result, dict) else []
+        )
+        subscribed = [
+            str(s.get("name") or "")
+            for s in subscriptions
+            if isinstance(s, dict)
+        ]
+        if self._streams_filter is None:
+            # "*" cannot be enumerated, so report what we are subscribed to
+            # instead of pretending we verified the monitor set.
+            logger.info(
+                "zulip reaction triggers enabled; monitoring all streams; "
+                "subscribed to: %s",
+                ", ".join(sorted(n for n in subscribed if n)) or "(none)",
+            )
+            return
+        missing = find_unsubscribed_streams(
+            sorted(self._streams_filter), subscribed
+        )
+        if missing:
+            logger.warning(
+                "zulip reaction triggers will not fire in monitored streams "
+                "the bot is not subscribed to: %s",
+                ", ".join(missing),
+            )
+            await self._audit_logger.log_event(
+                "reaction_trigger_subscription_gap",
+                {"streams": missing},
+            )
+        else:
+            logger.info(
+                "zulip reaction triggers: bot is subscribed to every "
+                "monitored stream"
+            )
 
     async def resolve_topic(self, stream_id: int, topic: str) -> dict[str, Any]:
         """Mark a topic as resolved by prepending ✔.
@@ -3133,15 +4399,25 @@ class ZulipAdapter(BasePlatformAdapter):
             return False
 
     async def get_user_info(self, user_id_or_email: str) -> Optional[dict]:
-        """Get information about a user."""
-        try:
-            result = await self._sdk_call(
-                self.client.get_user,
-                user_id_or_email,
-                timeout=self._send_timeout,
+        """Get information about a user, by numeric id or email address.
+
+        ``zulip`` 0.9.1 has no ``get_user`` method (issue #196), so the lookup
+        goes through whatever the installed SDK actually exposes.
+        """
+        fn, args = _user_lookup_call(self.client, user_id_or_email)
+        if fn is None:
+            logger.error(
+                "get_user_info unavailable: %s exposes no supported user lookup "
+                "(issue #196)",
+                type(self.client).__name__,
             )
-            if result.get("result") == "success":
-                user = result.get("user", {})
+            return None
+        try:
+            result = await self._sdk_call(fn, *args, timeout=self._send_timeout)
+            if isinstance(result, dict) and result.get("result") == "success":
+                user = result.get("user") or {}
+                if isinstance(user, list):
+                    user = user[0] if user else {}
                 return {
                     "user_id": user.get("user_id"),
                     "email": user.get("email"),
@@ -3149,10 +4425,13 @@ class ZulipAdapter(BasePlatformAdapter):
                     "is_admin": user.get("is_admin", False),
                     "is_bot": user.get("is_bot", False),
                 }
-            logger.warning("get_user_info failed: %s", result.get("msg"))
+            logger.warning(
+                "get_user_info failed: %s",
+                result.get("msg") if isinstance(result, dict) else result,
+            )
             return None
         except Exception as e:
-            logger.error("get_user_info error: %s", e)
+            logger.error("get_user_info error: %s", mask_pii(str(e)))
             return None
 
     async def send_image_file(
@@ -3213,7 +4492,7 @@ class ZulipAdapter(BasePlatformAdapter):
         metadata: Optional[dict],
         as_image: bool,
     ) -> SendResult:
-        data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
+        data_dir = runtime_scope.get_profile_data_dir()
         try:
             url = await upload_file_to_zulip(
                 self.client, file_path, data_dir, account_id=self.email
@@ -3341,10 +4620,14 @@ class ZulipAdapter(BasePlatformAdapter):
                     error=mask_pii(str(e)),
                 )
             )
+            await self._audit_logger.log_deliver_failed(
+                "invalid_target", chat_id=prompt.chat_id
+            )
             return SendResult(success=False, message_id="")
 
         if target["type"] == "dm":
             base: dict[str, Any] = {"type": "private", "to": target["user_ids"]}
+            audit_topic: Optional[str] = None
         else:
             # prompt.metadata carries the turn's routing metadata (thread_id =
             # a conversation id with stable topic sessions, else the topic
@@ -3353,6 +4636,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 self._topic_cache.get(prompt.chat_id, "general")
             )
             base = {"type": "stream", "to": target["stream_id"], "topic": topic}
+            audit_topic = topic
 
         async def _send(request: dict[str, Any]) -> Optional[SendResult]:
             try:
@@ -3367,16 +4651,26 @@ class ZulipAdapter(BasePlatformAdapter):
                         error=mask_pii(str(e)),
                     )
                 )
+                await self._audit_logger.log_deliver_failed(
+                    "send_exception", chat_id=prompt.chat_id, topic=audit_topic
+                )
                 return None
             if result.get("result") == "success":
                 logger.debug("zulip approval message sent to %s", mask_pii(prompt.chat_id))
-                return SendResult(success=True, message_id=str(result.get("id", "")))
+                message_id = str(result.get("id", ""))
+                await self._audit_logger.log_deliver_payload(
+                    chat_id=prompt.chat_id, topic=audit_topic, message_id=message_id
+                )
+                return SendResult(success=True, message_id=message_id)
             logger.error(
                 format_zulip_log(
                     "zulip approval prompt send failed",
                     chat_id=mask_pii(prompt.chat_id),
                     error=mask_pii(str(result)),
                 )
+            )
+            await self._audit_logger.log_deliver_failed(
+                "api_error", chat_id=prompt.chat_id, topic=audit_topic
             )
             return None
 
@@ -3442,7 +4736,26 @@ class ZulipAdapter(BasePlatformAdapter):
                 "count": len(hits),
             },
         )
+        await self._audit_logger.log_deliver_skipped(
+            "secret_leak_blocked", chat_id=chat_id
+        )
         return summary
+
+    async def _render_refs(self, text: str) -> str:
+        """Rewrite validated GitHub refs before chunking (#150).
+
+        Handles both ``[[zulip_ref: …]]`` markers and bare ``github.com``
+        pull/issue/commit/run URLs written in prose. Best-effort: rendering
+        must never fail a send, and must never make a reply worse -- an
+        unconfirmed bare URL is left exactly as written.
+        """
+        try:
+            return await render_refs(text)
+        except Exception as e:
+            logger.warning(
+                "zulip ref rendering failed, sending as-is: %s", mask_pii(str(e))
+            )
+            return text
 
     async def send(
         self,
@@ -3456,10 +4769,16 @@ class ZulipAdapter(BasePlatformAdapter):
         metadata = metadata or {}
         media_files = media_files or []
 
+        # Reasoning hygiene (Issue #152): a model that emits its scratchpad
+        # inline must never ship that block to Zulip. Applied before the secret
+        # guard so a credential inside a block is dropped, not refused.
+        content = strip_think_blocks(content)
+
         # Outbound secret guard (Issue #136). Checked before media upload, so a
         # message we are about to refuse cannot leave a stray upload behind.
         leaked = self._detect_secret_leak(content)
         if leaked:
+            self._note_delivery_attempt(chat_id, metadata)
             summary = await self._refuse_secret_leak(leaked, chat_id)
             logger.error(
                 "zulip send refused: %s. Remove it and rotate the credential.",
@@ -3471,7 +4790,7 @@ class ZulipAdapter(BasePlatformAdapter):
         uploaded_urls = []
         uploaded_local_paths = []
         if media_files:
-            data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
+            data_dir = runtime_scope.get_profile_data_dir()
             for file_path in media_files:
                 # Security: reject URL-like values in media_files (must be local paths)
                 if isinstance(file_path, str) and (file_path.startswith("http://") or file_path.startswith("https://")):
@@ -3503,6 +4822,10 @@ class ZulipAdapter(BasePlatformAdapter):
 
         # Extract inline topic directive if present
         content, topic_override = extract_topic_directive(content)
+
+        # Rewrite actionable refs before truncation and chunking, so a marker
+        # can never be split across two messages (Issue #150).
+        content = await self._render_refs(content)
 
         # Hard cap before chunking (mirrors sibling plugin's maxMessageLength).
         max_length = _resolve_max_message_length()
@@ -3539,14 +4862,20 @@ class ZulipAdapter(BasePlatformAdapter):
         metadata: dict,
         topic_override: Optional[str],
     ) -> SendResult:
-        """Send a single (unchunked) message, editing placeholder if present."""
+        """Send a single (unchunked) message."""
         # Prepend response prefix if configured (Issue #65)
         if self._response_prefix and content:
             content = self._response_prefix + content
 
+        # This work item produced something to deliver, so a run that does not
+        # send here must not also be reported as "produced nothing" (#145).
+        self._note_delivery_attempt(chat_id, metadata)
+        audit_topic = _metadata_topic(metadata)
+
         try:
             target = _parse_target(chat_id)
             if target["type"] == "dm":
+                audit_topic = None
                 result = await self._sdk_call(
                     self.client.send_message,
                     {
@@ -3561,6 +4890,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 topic = topic_override or self._routed_topic(stream_id, metadata)
                 if not topic:
                     topic = self._topic_cache.get(chat_id, "general")
+                audit_topic = topic
 
                 result = await self._sdk_call(
                     self.client.send_message,
@@ -3575,12 +4905,14 @@ class ZulipAdapter(BasePlatformAdapter):
 
             if result.get("result") == "success":
                 logger.debug("zulip message sent to %s", chat_id)
+                message_id = str(result.get("id", ""))
                 # This work item produced a reply, so its trace can say so
                 # instead of reporting a silent run (epic #139 / #158).
                 self._note_trace_reply(chat_id, metadata)
-                return SendResult(
-                    success=True, message_id=str(result.get("id", ""))
+                await self._audit_logger.log_deliver_payload(
+                    chat_id=chat_id, topic=audit_topic, message_id=message_id
                 )
+                return SendResult(success=True, message_id=message_id)
             else:
                 logger.error(
                     format_zulip_log(
@@ -3588,6 +4920,9 @@ class ZulipAdapter(BasePlatformAdapter):
                         chat_id=mask_pii(chat_id),
                         error=mask_pii(str(result)),
                     )
+                )
+                await self._audit_logger.log_deliver_failed(
+                    "api_error", chat_id=chat_id, topic=audit_topic
                 )
                 return SendResult(success=False, message_id="")
 
@@ -3598,6 +4933,9 @@ class ZulipAdapter(BasePlatformAdapter):
                     chat_id=mask_pii(chat_id),
                     error=mask_pii(str(e)),
                 )
+            )
+            await self._audit_logger.log_deliver_failed(
+                "send_exception", chat_id=chat_id, topic=audit_topic
             )
             return SendResult(success=False, message_id="")
 
@@ -3611,17 +4949,17 @@ def validate_config(config) -> bool:
     """Validate that required credentials are present."""
     extra = getattr(config, "extra", {}) or {}
     return bool(
-        (os.getenv("ZULIP_API_KEY") or extra.get("api_key"))
-        and (os.getenv("ZULIP_EMAIL") or extra.get("email"))
-        and (os.getenv("ZULIP_SITE") or extra.get("site"))
+        (runtime_scope.get_setting("ZULIP_API_KEY") or extra.get("api_key"))
+        and (runtime_scope.get_setting("ZULIP_EMAIL") or extra.get("email"))
+        and (runtime_scope.get_setting("ZULIP_SITE") or extra.get("site"))
     )
 
 
 def _env_enablement() -> dict | None:
     """Seed PlatformConfig.extra from environment variables."""
-    key = os.getenv("ZULIP_API_KEY", "").strip()
-    email = os.getenv("ZULIP_EMAIL", "").strip()
-    site = os.getenv("ZULIP_SITE", "").strip()
+    key = runtime_scope.get_setting("ZULIP_API_KEY", "").strip()
+    email = runtime_scope.get_setting("ZULIP_EMAIL", "").strip()
+    site = runtime_scope.get_setting("ZULIP_SITE", "").strip()
     if not (key and email and site):
         return None
 
@@ -3718,9 +5056,9 @@ def _resolve_standalone_credentials(pconfig) -> tuple[str, str, str]:
     variables win, then the platform config's ``extra`` mapping.
     """
     extra = getattr(pconfig, "extra", {}) or {}
-    site = os.getenv("ZULIP_SITE") or extra.get("site") or ""
-    email = os.getenv("ZULIP_EMAIL") or extra.get("email") or ""
-    api_key = os.getenv("ZULIP_API_KEY") or extra.get("api_key") or ""
+    site = runtime_scope.get_setting("ZULIP_SITE") or extra.get("site") or ""
+    email = runtime_scope.get_setting("ZULIP_EMAIL") or extra.get("email") or ""
+    api_key = runtime_scope.get_setting("ZULIP_API_KEY") or extra.get("api_key") or ""
     return site, email, api_key
 
 
@@ -3765,16 +5103,30 @@ async def _standalone_send(
             "error": "Zulip not configured (ZULIP_SITE, ZULIP_EMAIL, ZULIP_API_KEY required)"
         }
 
+    # Reasoning hygiene (Issue #152): the out-of-process path must drop a
+    # leaked scratchpad block too, before anything is uploaded or sent.
+    message = strip_think_blocks(message) or ""
+
+    # Delivery audit (Issue #145): same outcomes as the live send path, so a
+    # cron delivery that silently fails is a lookup rather than a mystery.
+    audit = AuditLogger(
+        data_dir=runtime_scope.get_profile_data_dir(),
+        account_id=email or "default",
+    )
+
     try:
         client = _get_cached_client(site, email, api_key)
     except ImportError as e:
+        await audit.log_deliver_failed("client_init_failed", chat_id=chat_id)
         return {"error": str(e)}
     except Exception as e:
+        await audit.log_deliver_failed("client_init_failed", chat_id=chat_id)
         return {"error": f"Zulip client init failed: {e}"}
 
     try:
         target = _parse_target(chat_id)
     except (TypeError, ValueError):
+        await audit.log_deliver_failed("invalid_target", chat_id=chat_id)
         return {
             "error": (
                 f"Invalid Zulip target {chat_id!r}: expected a numeric stream id "
@@ -3801,12 +5153,7 @@ async def _standalone_send(
                 summary,
             )
             try:
-                await AuditLogger(
-                    data_dir=os.environ.get(
-                        "HERMES_DATA_DIR", os.path.expanduser("~/.hermes")
-                    ),
-                    account_id=email or "default",
-                ).log_event(
+                await audit.log_event(
                     "secret_leak_blocked",
                     {
                         "chat_id": mask_pii(str(chat_id)),
@@ -3815,6 +5162,9 @@ async def _standalone_send(
                         "sources": [hit.name for hit in leaked],
                         "count": len(leaked),
                     },
+                )
+                await audit.log_deliver_skipped(
+                    "secret_leak_blocked", chat_id=chat_id
                 )
             except Exception:
                 pass  # auditing must never break the refusal itself
@@ -3831,7 +5181,7 @@ async def _standalone_send(
     # Media: upload first, then link — same shape as ZulipAdapter.send().
     uploaded_urls: list[str] = []
     if media_files:
-        data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
+        data_dir = runtime_scope.get_profile_data_dir()
         for file_path in media_files:
             if isinstance(file_path, (tuple, list)):
                 # Some callers pass (path, is_voice) pairs.
@@ -3860,6 +5210,15 @@ async def _standalone_send(
 
     content, topic_directive = extract_topic_directive(content)
 
+    # Rewrite actionable refs before truncation, so a marker can never be split
+    # (Issue #150). Best-effort: a failure leaves the reply untouched.
+    try:
+        content = await render_refs(content)
+    except Exception as e:
+        logger.warning(
+            "zulip ref rendering failed, sending as-is: %s", mask_pii(str(e))
+        )
+
     # Hard cap before chunking (mirrors sibling plugin's maxMessageLength).
     max_length = _resolve_max_message_length()
     if max_length > 0:
@@ -3871,6 +5230,7 @@ async def _standalone_send(
 
     if target["type"] == "dm":
         payload = {"type": "private", "to": target["user_ids"], "content": content}
+        audit_topic: Optional[str] = None
     else:
         topic = topic_directive or (str(thread_id).strip() if thread_id else "") or STANDALONE_DEFAULT_TOPIC
         payload = {
@@ -3879,6 +5239,7 @@ async def _standalone_send(
             "topic": topic,
             "content": content,
         }
+        audit_topic = topic
 
     try:
         result = await asyncio.wait_for(
@@ -3886,12 +5247,25 @@ async def _standalone_send(
             timeout=send_timeout,
         )
     except asyncio.TimeoutError:
+        await audit.log_deliver_failed(
+            "send_timeout", chat_id=chat_id, topic=audit_topic
+        )
         return {"error": f"Zulip send timed out after {send_timeout}s"}
     except Exception as e:
+        await audit.log_deliver_failed(
+            "send_exception", chat_id=chat_id, topic=audit_topic
+        )
         return {"error": f"Zulip send failed: {e}"}
 
     if isinstance(result, dict) and result.get("result") == "success":
-        return {"success": True, "message_id": str(result.get("id", ""))}
+        message_id = str(result.get("id", ""))
+        await audit.log_deliver_payload(
+            chat_id=chat_id, topic=audit_topic, message_id=message_id
+        )
+        return {"success": True, "message_id": message_id}
+    await audit.log_deliver_failed(
+        "api_error", chat_id=chat_id, topic=audit_topic
+    )
     if isinstance(result, dict):
         detail = " ".join(
             str(result[k]) for k in ("code", "msg") if result.get(k)

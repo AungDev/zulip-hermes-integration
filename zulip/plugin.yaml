@@ -1,7 +1,7 @@
 name: zulip
 label: Zulip
 kind: platform
-version: 1.0.0
+version: 1.10.1
 description: Zulip gateway adapter for Hermes Agent. Supports streams with topics and private messages.
 author: Niyaz
 requires_env:
@@ -35,6 +35,12 @@ optional_env:
   - name: ZULIP_REACTION_ERROR
     description: "Emoji on error (default: warning)"
     prompt: "Error reaction emoji"
+  - name: ZULIP_REACTION_TRIGGERS
+    description: 'JSON object mapping emoji name to an instruction, e.g. {"+1": "Proceed with the proposed step."}. A reaction on the bot''s own stream message dispatches that instruction as a turn in the same topic (default: none — off)'
+    prompt: "Reaction triggers (JSON)"
+  - name: ZULIP_REACTION_TRIGGER_ANY_MESSAGE
+    description: "Allow reaction triggers on messages the bot did not author (default: false — only the bot's own messages)"
+    prompt: "Allow reaction triggers on any message"
   - name: ZULIP_TEXT_CHUNK_LIMIT
     description: "Max chars per outbound message (default: 10000)"
     prompt: "Text chunk limit"
@@ -95,9 +101,72 @@ optional_env:
   - name: ZULIP_REQUIRE_MENTION
     description: "Require @mention in streams (default: true)"
     prompt: "Require mention"
+  - name: ZULIP_ENGAGEMENT_MODE
+    description: 'Sticky follow-ups after @mention: "off" (default) or "sticky_topic"'
+    prompt: "Engagement mode"
+  - name: ZULIP_ENGAGEMENT_SCOPE
+    description: 'Who can continue without @mention: "user" (default, same person) or "topic" (anyone in topic)'
+    prompt: "Engagement scope"
+  - name: ZULIP_ENGAGEMENT_TTL_MINUTES
+    description: "Minutes of idle time before sticky engagement expires (default: 45)"
+    prompt: "Engagement TTL minutes"
+  - name: ZULIP_ENGAGEMENT_EXPIRY_NOTICE
+    description: "Post a topic notice when sticky engagement idle-expires (default: true)"
+    prompt: "Engagement expiry notice"
+  - name: ZULIP_ENGAGEMENT_EXPIRY_SCAN_SECONDS
+    description: "How often to scan for expired engagements (default: 30)"
+    prompt: "Expiry scan interval seconds"
   - name: ZULIP_TOPIC_SESSIONS
     description: "Give each stream topic its own conversation session (default: false)"
     prompt: "Per-topic sessions"
   - name: ZULIP_STREAM_OVERRIDES
     description: 'Per-stream chatmode overrides as a JSON object, e.g. {"bot lab": {"chatmode": "onmessage"}}'
     prompt: "Per-stream chatmode overrides (JSON)"
+  - name: ZULIP_DM_POLICY
+    description: 'Who can DM the bot: open, allowlist, disabled (default: open)'
+    prompt: "DM policy"
+  - name: ZULIP_ALLOW_ALL_USERS
+    description: "Skip the allowed-users check and accept any Zulip user (default: false)"
+    prompt: "Allow all users"
+  - name: ZULIP_HOME_CHANNEL
+    description: "Default stream id for cron `deliver: zulip` targets (e.g. 573423)"
+    prompt: "Default cron stream id"
+  - name: ZULIP_MAX_MESSAGE_LENGTH
+    description: "Hard cap on a single outbound message in characters, 0 disables (default: 20000)"
+    prompt: "Max outbound message length"
+  - name: ZULIP_MAX_MESSAGES_PER_MINUTE
+    description: "Maximum outbound messages per minute (default: 60)"
+    prompt: "Max messages per minute"
+  - name: ZULIP_DM_SESSION_TURN_LIMIT
+    description: "Rotate the DM session every N turns to limit context growth, 0 disables (default: 20)"
+    prompt: "DM session turn limit"
+  - name: ZULIP_TYPING_DELAY_SECONDS
+    description: "Legacy typing-indicator duration in seconds; typing is now owned by the gateway keep-typing loop"
+    prompt: "Typing delay (seconds)"
+  - name: HERMES_MEDIA_ALLOW_DIRS
+    description: "Extra directories the gateway may read inbound media from (os.pathsep- or comma-separated absolute paths)"
+    prompt: "Media allow dirs"
+  - name: ZULIP_SOFT_GATE
+    description: "Dispatch every monitored stream message like onmessage, tagging event metadata with addressed=true/false, so the bot watches a stream without replying to all of it (default: false)"
+    prompt: "Dispatch all stream messages (soft gate)"
+  - name: ZULIP_OBSERVE_GROUP
+    description: "Record non-addressed stream messages as bounded per-topic context without replying; the buffer is quoted into the prompt when the bot is next addressed in that topic (default: false)"
+    prompt: "Observe stream messages without replying"
+  - name: ZULIP_SESSION_QUEUE
+    description: "Queue a message that arrives while its topic (or DM) is mid-run behind the running turn instead of steering it into that turn, so one person cannot redirect another's work; separate topics still run in parallel (default: false)"
+    prompt: "Per-session message queue"
+  - name: ZULIP_QUEUE_CAP
+    description: "How many turns may wait behind one running session before a new message is dispatched immediately instead of being dropped (default: 20)"
+    prompt: "Session queue cap"
+  - name: ZULIP_HISTORY_MODE
+    description: 'Quote real stream/topic history into the prompt: "off", "on-demand" (only for history questions), or "always" (default: off)'
+    prompt: "History context mode"
+  - name: ZULIP_HISTORY_MAX_MESSAGES
+    description: "Maximum history messages quoted per turn (default: 8)"
+    prompt: "Max history messages"
+  - name: ZULIP_HISTORY_WINDOW_HOURS
+    description: "How far back topic history is harvested, in hours (default: 72)"
+    prompt: "History window (hours)"
+  - name: ZULIP_HISTORY_MAX_CHARS
+    description: "Maximum characters in the quoted history block (default: 4000)"
+    prompt: "Max history characters"
