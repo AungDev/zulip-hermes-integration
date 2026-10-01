@@ -16,6 +16,7 @@ PLUGIN_FILES = [
     "admin_actions.py",
     "audit_logger.py",
     "commands.py",
+    "conversations.py",
     "activity_trace.py",
     "dedupe_store.py",
     "display_names.py",
