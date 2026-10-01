@@ -1916,7 +1916,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 return current
             if _CONVERSATION_ID_RE.fullmatch(raw):
                 # Conv-shaped but not live: route by the LAST known topic
-                # name from the conversation's own tombstone row (never a
+                # name from the conversation's own former_holders row (never a
                 # ghost topic named like the id). No mapping is created —
                 # the orphaned session stays unreachable (R4/R10 intact).
                 try:
