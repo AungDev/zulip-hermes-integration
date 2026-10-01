@@ -13,6 +13,7 @@ Two things are therefore load-bearing here:
 """
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -209,6 +210,22 @@ class TestRunningGatewayNoticesExternalChanges:
         monkeypatch.setenv("ZULIP_DM_POLICY", "pairing")
         engine = PolicyEngine(data_dir=None)
         engine.refresh_if_changed()  # must not raise
+
+    def test_same_mtime_rewrite_is_still_picked_up(
+        self, pairing_engine, data_dir
+    ):
+        """Coarse file-timestamp clocks: a save landing in the same mtime
+        tick as the previous one must still be noticed (size and inode
+        ride along in the same stat())."""
+        code = _issue(pairing_engine)
+        path = Path(data_dir, "zulip_allowlist.json")
+        before = path.stat()
+        cli_engine = PolicyEngine(data_dir=data_dir)
+        cli_engine.approve_code(code)
+        # Force the collision coarse clocks produce naturally.
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        pairing_engine.refresh_if_changed()
+        assert pairing_engine.check_dm("newbie@example.com")[0] is True
 
 
 class TestCli:
