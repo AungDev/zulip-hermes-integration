@@ -39,25 +39,10 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
-
-
-def _session_created_at(session_id: str) -> Optional[float]:
-    """Epoch seconds parsed from a gateway session id, if shaped like one.
-
-    Gateway session ids embed their creation time (``YYYYMMDD_HHMMSS_hex``).
-    Returns ``None`` for ids that do not match the shape.
-    """
-    try:
-        date_part, time_part, _rest = str(session_id).split("_", 2)
-        stamp = datetime.strptime(f"{date_part}_{time_part}", "%Y%m%d_%H%M%S")
-    except (ValueError, AttributeError):
-        return None
-    return stamp.replace(tzinfo=timezone.utc).timestamp()
 
 
 def _new_conversation_id() -> str:
@@ -136,27 +121,6 @@ class TopicConversationRegistry:
                 )
                 """
             )
-            # v6 (additive for v5): per-session start labels — the topic
-            # name where each gateway session was created. The listing
-            # labels every session with its own start rather than the
-            # lineage's origin (which only matches until the first rename
-            # between generations). Missing records fall back to the
-            # lineage origin, so existing data keeps working.
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS session_starts (
-                  account_id      TEXT NOT NULL,
-                  channel_id      INTEGER NOT NULL,
-                  conversation_id TEXT NOT NULL,
-                  session_id      TEXT NOT NULL,
-                  started_in      TEXT NOT NULL,
-                  recorded_at     REAL NOT NULL,
-                  PRIMARY KEY (account_id, channel_id, session_id)
-                )
-                """
-            )
-            if version < 6:
-                self._conn.execute("PRAGMA user_version = 6")
 
     # -- R1 ----------------------------------------------------------------
 
@@ -546,104 +510,6 @@ class TopicConversationRegistry:
             )
 
     # -- R10 (deletion / orphaning) -----------------------------------------
-
-    def iter_conversations(self) -> List[Tuple[int, str]]:
-        """Every live conversation as ``(channel_id, conversation_id)``."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT DISTINCT channel_id, conversation_id FROM topic_map"
-                " WHERE account_id=?",
-                (self.account_id,),
-            ).fetchall()
-        return [(int(r[0]), str(r[1])) for r in rows]
-
-    # -- session start labels (v6) -----------------------------------------
-
-    def record_session_start(
-        self,
-        channel_id: int,
-        conversation_id: str,
-        session_id: str,
-        started_in: Optional[str] = None,
-    ) -> None:
-        """Record where a gateway session started (INSERT OR IGNORE).
-
-        First record wins — a session is never relabeled after the fact.
-        ``started_in`` defaults to the derived start (see
-        :meth:`derive_session_start`); nothing is written when no label
-        can be determined.
-        """
-        if started_in is None:
-            started_in = self.derive_session_start(
-                channel_id, conversation_id, session_id
-            )
-        if not started_in:
-            return
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO session_starts"
-                " (account_id, channel_id, conversation_id, session_id,"
-                "  started_in, recorded_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (
-                    self.account_id,
-                    channel_id,
-                    conversation_id,
-                    session_id,
-                    started_in,
-                    time.time(),
-                ),
-            )
-
-    def session_start(
-        self, channel_id: int, session_id: str
-    ) -> Optional[str]:
-        """The recorded start label for a gateway session, if any."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT started_in FROM session_starts"
-                " WHERE account_id=? AND channel_id=? AND session_id=?",
-                (self.account_id, channel_id, session_id),
-            ).fetchone()
-        return str(row[0]) if row is not None else None
-
-    def derive_session_start(
-        self, channel_id: int, conversation_id: str, session_id: str
-    ) -> Optional[str]:
-        """Best-effort start label for a session with no record yet.
-
-        The gateway session id embeds its creation time. If the session
-        was created after the conversation's last mapping change
-        (``updated_at`` moves only on mapping writes: mint, rename,
-        merge), it must have been created under the current name;
-        otherwise it predates every tracked change and the lineage origin
-        is the best available label. Pre-tracking history is not
-        recoverable for anyone — a one-time approximation for sessions
-        minted before the labels existed.
-        """
-        created = _session_created_at(session_id)
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT topic_name, origin_name, updated_at FROM topic_map"
-                " WHERE account_id=? AND channel_id=? AND conversation_id=?",
-                (self.account_id, channel_id, conversation_id),
-            ).fetchone()
-            if row is None:
-                tomb = self._conn.execute(
-                    "SELECT origin_name FROM tombstones"
-                    " WHERE account_id=? AND channel_id=? AND"
-                    " conversation_id=?",
-                    (self.account_id, channel_id, conversation_id),
-                ).fetchone()
-                return str(tomb[0]) if tomb is not None else None
-        topic_name, origin_name, updated_at = (
-            str(row[0]),
-            str(row[1]),
-            float(row[2]),
-        )
-        if created is not None and created > updated_at:
-            return topic_name
-        return origin_name
 
     def orphan_topic_sessions(self, channel_id: int, topic_name: str) -> int:
         """Topic deleted without rename/merge (R10): no beneficiary.
