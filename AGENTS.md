@@ -13,11 +13,11 @@ When a message arrives, check `source.chat_type`:
 | You control | Gateway handles automatically |
 |-------------|-------------------------------|
 | What you say | Topic threading (preserve `metadata.topic`) |
-| When to reply | Message chunking (splits >4000 chars) |
+| When to reply | Message chunking |
 | Tone/length | Reactions (👀 → ✅) |
 | | Placeholder editing ("Thinking...") |
 
-**Critical:** Stream messages in `onmessage` mode may not be for you. See [What to Ignore](#-what-to-ignore).
+**Critical:** a stream message may not be for you. See [What to Ignore](#-what-to-ignore).
 
 ### DM (`chat_type="dm"`)
 
@@ -38,6 +38,7 @@ Every `MessageEvent.metadata` contains:
     "conversation_turn": 12,        # int — cumulative messages in this chat
     "session_gap_seconds": 45.2,   # float — seconds since last message
     "topic_changed": False,         # bool — streams only
+    "addressed": True,             # bool — was this message aimed at you? (see below)
 }
 ```
 
@@ -45,11 +46,35 @@ Every `MessageEvent.metadata` contains:
 
 | Condition | What it means | What you should do |
 |-----------|---------------|-------------------|
+| `addressed` == False | You were given the message to *watch*, not to answer | Stay silent unless it plainly needs you |
 | `conversation_turn` > 20 AND `session_gap_seconds` < 60 | Dense conversation | Don't recycle old responses; user is engaged |
 | `session_gap_seconds` > 1800 (30 min) | New session | Prioritize recent context; old context may be stale |
 | `topic_changed` == True | Fresh subject | Treat as new topic; don't assume continuity |
 
 **Example:** `conversation_turn=25, session_gap_seconds=12` → The user has been rapidly messaging. Avoid template recycling.
+
+**`addressed` is the important new one.** It is always present on streams. It is `True` when
+you were mentioned or a trigger prefix fired, and `False` when you are being shown traffic
+you were not asked to answer (only happens when the admin turns on `ZULIP_SOFT_GATE`). A
+stream message with `addressed=False` is *context*, not a request.
+
+---
+
+## 📥 Understanding Your Prompt (Injected Blocks)
+
+Your prompt may contain quoted material the plugin added. These blocks are **not** the live
+message — never reply to them as if the user just said them.
+
+| Block | What it is | How to treat it |
+|-------|-----------|-----------------|
+| `[Zulip history — N earlier message(s) in #stream / topic]` … `[end history]` | Real earlier messages from **this topic**, harvested for context | Cite it as evidence ("Dana saw this 3d ago…"), don't answer it |
+| `[Observed topic history - not addressed to you]` | Non-addressed chatter buffered while you were quiet | Treat as "what I missed"; useful if asked what happened |
+| `[Zulip reaction] <name> reacted with :<emoji>: to your message …` | A reaction trigger fired (an admin mapped that emoji to an instruction) | Follow the instruction embedded in the message |
+
+**Reaction turns are real work requests.** If the admin configured `ZULIP_REACTION_TRIGGERS`
+(e.g. `+1` → "Proceed with the proposed step."), a 👍 on your own message produces a turn
+whose text begins with `[Zulip reaction]`. Act on the instruction; the reacting human is the
+sender, so reply as you would to them.
 
 ---
 
@@ -75,16 +100,25 @@ Messages starting with `/` are intercepted **before** they reach you:
 
 ### Stream Messages (Critical)
 
-In `onmessage` mode, you see **every** message in subscribed streams, not just ones meant for you:
+Depending on the admin's trigger mode, you may see **every** message in a stream, not just ones meant for you:
 
 ```
-#engineering
+#general
 Alice: "Hey Bob, did you fix the deploy?"    ← You see this. IGNORE.
 Bob: "Yeah, pushing now."                     ← You see this. IGNORE.
 Carol: "@hermes-bot review this PR"           ← You see this. RESPOND.
 ```
 
 **Rule:** If you weren't @mentioned and there's no explicit question directed at you, stay silent.
+
+**Better rule, when `metadata.addressed` is available:** if `addressed == False`, someone
+configured you to *watch* this stream. Only speak if the message is plainly for you.
+
+**Exception — sticky engagement.** If the admin enabled sticky follow-ups, a message that
+reaches you **without** a mention may still be a continuation of a conversation you already
+started in that topic. Those are marked `addressed`, and you should answer them normally. Do
+not apply the "no mention → stay silent" rule to them; the admin turned that rule off for
+this window deliberately.
 
 ### Messages From Other Bots
 
@@ -97,8 +131,8 @@ If `sender_email` ends with `@zulipchat.com` or contains "bot", it's likely anot
 **You MUST preserve the original topic.** The gateway passes it in `metadata.topic`.
 
 ```
-User in #engineering / api-review: "What do you think?"
-Your reply goes to: #engineering / api-review   ← same topic
+User in #general / api-review: "What do you think?"
+Your reply goes to: #general / api-review   ← same topic
 ```
 
 **Don't change topics unless the user explicitly asks.** The gateway handles topic directives automatically:
@@ -147,6 +181,24 @@ Temp files auto-delete after upload. Path traversal is blocked.
 
 ---
 
+## 🔗 Links You Write
+
+GitHub links in your replies are **validated before sending** (always on, no setting). If you
+write a bare pull/issue/commit/run URL or a `[[zulip_ref: URL | label]]` marker, the plugin
+checks it against the GitHub API and renders a confirmed one as a real link:
+
+```
+you write:  Shipped in https://github.com/owner/repo/pull/128
+user sees:  Shipped in [owner/repo#128](https://github.com/owner/repo/pull/128)
+```
+
+A URL that cannot be confirmed (404, private, rate-limited) is **left exactly as you wrote
+it** — the plugin never rewrites prose into something worse. Only `https://github.com/...` is
+touched, nothing is authenticated, and at most 3 refs per message are checked. So: write real
+links, and don't bother formatting them.
+
+---
+
 ## 🧍 Your Identity
 
 | Attribute | Value | How to reference |
@@ -162,6 +214,25 @@ Temp files auto-delete after upload. Path traversal is blocked.
 
 ---
 
+## ⚙️ Opt-In Behaviours You May Encounter
+
+These are off unless the admin enabled them. Knowing they exist stops you misreading a
+situation:
+
+| Behaviour | What changes for you | How to tell it's on |
+|-----------|---------------------|---------------------|
+| **Sticky engagement** | Follow-ups arrive with no mention, in a topic you were already talking in | the message is `addressed` but has no @mention in it |
+| **Per-session queue** | Your previous turn in this topic may still be running; the next message waited behind it | a run you didn't start can precede the message; don't assume a dropped request |
+| **Activity trace** | One status message in your topic is being edited live with your progress | `ZULIP_ACTIVITY_TRACE` is on (see below) |
+| **Observed stream traffic** | Non-addressed messages may appear quoted as `[Observed topic history …]` | the label is in your prompt |
+| **History context** | A `[Zulip history — …]` block may precede the live message | the label is in your prompt |
+
+**If a request seems to have been ignored, it may have been queued rather than dropped** —
+the reply is coming, after the turn ahead of it finishes. Don't apologise for a message you
+haven't actually seen.
+
+---
+
 ## 📊 Activity Trace (Opt-In)
 
 Long runs can show a live status board in the conversation — one message the gateway
@@ -170,21 +241,27 @@ edits as work proceeds, closed out when the run ends. It is **off by default**
 **don't assume the feature is broken.** While it is on you are also offered the
 `zulip_progress` tool (mode B): use it for intent a tool call cannot reveal, sparingly.
 
+---
+
 ## 📋 Quick Reference
 
 ### Do
 - ✅ Preserve topic for stream replies
+- ✅ Check `metadata.addressed` before deciding to stay silent
 - ✅ Reference previous context naturally
 - ✅ Be concise in busy streams
 - ✅ Respond to unknown `/` commands (they're for you)
 - ✅ Use `conversation_turn` + `session_gap_seconds` to avoid stale responses
+- ✅ Answer follow-ups in an engaged topic even without a mention
 
 ### Don't
 - ❌ Change the topic unless asked
-- ❌ Respond to every stream message in `onmessage` mode
+- ❌ Respond to every stream message when `addressed` is False
+- ❌ Treat `[Zulip history …]` / `[Observed topic history …]` blocks as things the user just said
 - ❌ Send DMs to users who messaged you in a stream
 - ❌ Ignore topic names — they're the primary organization mechanism in Zulip
 - ❌ Assume a high `conversation_turn` means the user is frustrated (could just be a long chat)
+- ❌ Assume silence means a dropped message — it may be queued behind a running turn
 
 ### Troubleshooting
 
@@ -192,7 +269,24 @@ edits as work proceeds, closed out when the run ends. It is **off by default**
 |-----------|-------------|-------------------|
 | "Bot isn't responding" | Not subscribed to stream / wrong trigger mode | "Ask your admin to check if the bot is subscribed to this stream and verify the trigger mode." |
 | "I can't DM the bot" | `ZULIP_DM_POLICY` is `allowlist` or `pairing` | "Contact your admin to get approved for DM access." |
-| "The bot replies to everything" | `ZULIP_CHATMODE=onmessage` | "The admin can switch to `oncall` mode so the bot only responds to mentions." |
+| "The bot replies to everything" | `ZULIP_CHATMODE=onmessage` with mention-gating off | "The admin can switch to `oncall` mode so the bot only responds to mentions." |
+| "Bot went quiet mid-conversation" | sticky-engagement window lapsed | "Mention the bot again to reopen the conversation in that topic." |
+| "My message was ignored" | it may be queued behind a running turn | "The bot works one request at a time per topic; your reply is coming." |
+
+---
+
+## 🔌 Gateway Compatibility
+
+| Hermes gateway | Native exec-approval buttons | Reply routing (`thread_id`) |
+|----------------|------------------------------|-----------------------------|
+| **≥ 0.21.3** | ✅ Clickable buttons — Allow Once / Allow Session / Always Allow / Deny | ✅ |
+| 0.21.0 – 0.21.2 | ➖ Falls back to plain-text `/approve` / `/deny` instructions | ✅ |
+| **0.18.2** (`__min_hermes__`) | ➖ Not available (import guarded) | ✅ |
+| < 0.18.2 | ❌ Unsupported | — |
+
+Native buttons rely on the gateway's `_send_exec_approval_prompt` hook, imported defensively
+so older gateways still load. A real-host contract gate for these symbols lives in
+[scripts/check_compat.py](scripts/check_compat.py).
 
 ---
 
