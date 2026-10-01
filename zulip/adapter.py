@@ -1946,6 +1946,13 @@ class ZulipAdapter(BasePlatformAdapter):
                 logger.exception(
                     "zulip legacy-session migration failed; continuing with fresh keys"
                 )
+            try:
+                self._backfill_session_starts()
+            except Exception:
+                # Non-critical: labels fall back to the lineage origin.
+                logger.debug(
+                    "zulip session-start backfill failed", exc_info=True
+                )
 
     def _migrate_legacy_topic_sessions(self) -> int:
         """One-time continuity migration (upgrade or first enable).
@@ -2067,6 +2074,87 @@ class ZulipAdapter(BasePlatformAdapter):
                 return key, entry
         return None, None
 
+    def _observe_session_start(
+        self, stream_id: int, conversation_id: str
+    ) -> None:
+        """First sight of a conversation's live session records its start.
+
+        Labels are per session (the topic name where the session was
+        created — the current name for a freshly minted generation), not
+        per lineage, so they stay truthful across renames between
+        generations. First record wins; derivation (see
+        ``derive_session_start``) covers sessions minted before the
+        labels existed. Failures never disturb message flow.
+        """
+        if self._conversations is None:
+            return
+        try:
+            _key, entry = self._entry_for_conversation(
+                self._route_entries(), conversation_id
+            )
+            if entry is None or not entry.session_id:
+                return
+            if (
+                self._conversations.session_start(stream_id, entry.session_id)
+                is None
+            ):
+                self._conversations.record_session_start(
+                    stream_id, conversation_id, entry.session_id
+                )
+        except Exception:
+            logger.debug(
+                "zulip session-start observation failed [conv=%s]",
+                conversation_id, exc_info=True,
+            )
+
+    def _backfill_session_starts(self) -> int:
+        """Record start labels for every known session (idempotent).
+
+        Runs at store wiring after the legacy migration: for each live
+        conversation, enumerate its gateway sessions (live routing entry
+        plus past generations) and record each missing label via the
+        registry's derivation. ``INSERT OR IGNORE`` means existing
+        records always win and restarts only ever fill gaps.
+        """
+        if self._conversations is None:
+            return 0
+        entries = self._route_entries()
+        db = self._session_db()
+        recorded = 0
+        for channel_id, conversation_id in self._conversations.iter_conversations():
+            key, entry = self._entry_for_conversation(entries, conversation_id)
+            ids = []
+            if entry is not None and entry.session_id:
+                ids.append(entry.session_id)
+            if db is not None and key is not None:
+                try:
+                    rows = db.list_sessions_rich(
+                        session_key=key, limit=50,
+                        order_by_last_active=True, include_hidden=True,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "zulip session enumeration unavailable [conv=%s]: %s",
+                        conversation_id, exc,
+                    )
+                    rows = []
+                for row in rows:
+                    sid = (row or {}).get("id") or (row or {}).get(
+                        "session_id")
+                    if sid and sid not in ids:
+                        ids.append(sid)
+            for sid in ids:
+                if self._conversations.session_start(channel_id, sid) is None:
+                    self._conversations.record_session_start(
+                        channel_id, conversation_id, sid
+                    )
+                    recorded += 1
+        if recorded:
+            logger.debug(
+                "zulip session-start backfill recorded %d labels", recorded
+            )
+        return recorded
+
     def _session_db(self):
         """Gateway seam: ``SessionStore._db`` (the state-db handle, v0.21.5).
 
@@ -2178,8 +2266,12 @@ class ZulipAdapter(BasePlatformAdapter):
                     marker = " **(last)**"
                 else:
                     marker = ""
+                label = (
+                    self._conversations.session_start(stream_id, sid)
+                    or origin
+                )
                 lines.append(
-                    f'{number}) `{sid}`{marker} — started in "{origin}"'
+                    f'{number}) `{sid}`{marker} — started in "{label}"'
                 )
         body = [f"📋 Sessions in this topic: {number}"]
         if lines:
@@ -2326,6 +2418,12 @@ class ZulipAdapter(BasePlatformAdapter):
                 "That lineage moved while switching — please try"
                 " `/continue` again."
             )
+        self._conversations.record_session_start(
+            stream_id, conversation_id, session_id
+        )
+        label = (
+            self._conversations.session_start(stream_id, session_id) or origin
+        )
         logger.debug(
             "zulip gateway session switched via /continue"
             " [channel=%s conv=%s session=%s topic=%r]",
@@ -2333,7 +2431,7 @@ class ZulipAdapter(BasePlatformAdapter):
         )
         return (
             f"🔗 This topic now talks in session `{session_id}`"
-            f', started in **{origin}**.'
+            f', started in **{label}**.'
         )
 
     async def _handle_message_delete_event(self, event: dict) -> None:
@@ -2734,6 +2832,11 @@ class ZulipAdapter(BasePlatformAdapter):
                             topic,
                             anchor_message_id=int(message_id) if message_id else None,
                         )
+                    # Per-session start labels (v6): first sight of the
+                    # conversation's live session records where it started.
+                    self._observe_session_start(
+                        stream_id, source_kwargs["thread_id"]
+                    )
                 # Malformed stream_id: no thread_id → degrades to the
                 # per-stream session (unreachable for well-formed events).
             source = self.build_source(**source_kwargs)
