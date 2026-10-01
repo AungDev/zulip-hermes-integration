@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import weakref
@@ -640,6 +641,224 @@ def _resolve_chatmode(stream_name: Optional[str] = None) -> tuple[str, list[str]
     return mode, prefixes, require_mention
 
 
+def _resolve_soft_gate() -> bool:
+    """Whether monitored stream messages are all dispatched (issue #153).
+
+    Off by default. When on, a stream message is dispatched like
+    ``ZULIP_CHATMODE=onmessage`` but its metadata carries ``addressed=False``
+    unless the bot was mentioned or an onchar prefix fired, so the agent can
+    watch a busy stream without answering all of it.
+    """
+    return runtime_scope.get_setting("ZULIP_SOFT_GATE", "").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+
+
+def _resolve_observe_group() -> bool:
+    """Whether non-addressed stream messages are recorded as topic context.
+
+    Off by default (issue #153). Observed messages are kept in a bounded
+    in-adapter buffer and never dispatched; the buffer is prepended to the
+    agent-facing text the next time the bot is addressed in the same topic.
+    """
+    return runtime_scope.get_setting("ZULIP_OBSERVE_GROUP", "").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+
+
+def _resolve_history_mode() -> str:
+    """How much real stream/topic history is quoted into the prompt (#148).
+
+    ``off`` (default) never harvests, so no extra Zulip round-trip is made;
+    ``on-demand`` harvests only for a message that reads like a "do we already
+    know this?" question; ``always`` harvests for every inbound stream message.
+    Anything unrecognised falls back to ``off`` with a warning.
+    """
+    raw = (runtime_scope.get_setting("ZULIP_HISTORY_MODE", "") or "").strip().lower()
+    if raw in ("off", "on-demand", "always"):
+        return raw
+    if raw:
+        logger.warning(
+            "ZULIP_HISTORY_MODE=%r is not one of off/on-demand/always; using off",
+            raw,
+        )
+    return "off"
+
+
+def _resolve_int_setting(name: str, default: int, minimum: int = 1) -> int:
+    """Read a positive integer setting, warning and falling back when invalid."""
+    raw = (runtime_scope.get_setting(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if value < minimum:
+        logger.warning(
+            "%s=%d is below the minimum %d; using %d", name, value, minimum, default
+        )
+        return default
+    return value
+
+
+#: Caps for the observed-topic buffer (#153). Per topic *and* across topics, so
+#: neither one busy topic nor a long-running bot can grow without limit.
+OBSERVED_MAX_MESSAGES = 20
+OBSERVED_MAX_CHARS = 4000
+OBSERVED_MAX_TOPICS = 200
+
+#: Labels marking quoted context so the agent can tell it from the live
+#: message (#153, #148).
+OBSERVED_HISTORY_LABEL = "[Observed topic history - not addressed to you]"
+FETCHED_HISTORY_LABEL = "[Topic history - recent messages quoted for context]"
+
+#: Best-effort budget for one history harvest (#148). A slow or failing fetch
+#: is dropped rather than awaited beyond this.
+HISTORY_FETCH_TIMEOUT = 2.0
+
+#: Narrow "do we already know this?" question shapes for ``on-demand`` history
+#: (#148). Deliberately conservative: a harvest costs one Zulip round-trip and
+#: a slice of the context budget, so a passing mention of history is not enough.
+_HISTORY_INTENT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bhave we\b[^?]{0,80}\b(seen|had|discussed|covered|decided|talked)\b",
+        r"\bdid we\b[^?]{0,80}\b(discuss|decide|agree|see|cover|mention|talk)\b",
+        r"\bwhat did we\b",
+        r"\bwhen did we\b",
+        r"\bdo we (already )?(know|have)\b",
+        r"\b(as|like) (we|i) (discussed|mentioned|said|agreed)\b",
+        r"\bwe (already|previously)\b",
+        r"\b(earlier|previously|before now|last (week|month|time))\b",
+        r"\bhas this (come up|been (asked|raised|seen))\b",
+        r"\bany (prior|previous|earlier)\b",
+    )
+)
+
+
+def _history_intent_matches(text: str) -> bool:
+    """Whether ``text`` reads like a question about something already discussed."""
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _HISTORY_INTENT_PATTERNS)
+
+
+def _joined_len(lines: list[str]) -> int:
+    """Length of ``"\\n".join(lines)`` without building the string."""
+    if not lines:
+        return 0
+    return sum(len(line) for line in lines) + len(lines) - 1
+
+
+class ObservedContextBuffer:
+    """Bounded per-topic memory of stream messages the bot was not addressed in.
+
+    Deliberately in-adapter state (issue #153). The design source appended to
+    the host session transcript through ``gateway.session`` internals, which
+    this plugin cannot rely on, so observation is kept here instead: a
+    deterministic buffer keyed by ``(stream_id, topic)`` so topics never leak
+    into each other, bounded on three axes — lines per topic, characters per
+    topic, and tracked topics. The oldest line (or the least-recently-used
+    topic) is dropped first.
+    """
+
+    def __init__(
+        self,
+        max_messages: int = OBSERVED_MAX_MESSAGES,
+        max_chars: int = OBSERVED_MAX_CHARS,
+        max_topics: int = OBSERVED_MAX_TOPICS,
+    ):
+        self._max_messages = max(1, max_messages)
+        self._max_chars = max(1, max_chars)
+        self._max_topics = max(1, max_topics)
+        self._topics: "OrderedDict[tuple[str, str], list[str]]" = OrderedDict()
+
+    def add(self, stream_id: Any, topic: Any, line: str) -> None:
+        """Append one quoted line, evicting oldest entries to stay in budget."""
+        line = (line or "").strip()
+        if not line:
+            return
+        key = (str(stream_id), str(topic or ""))
+        lines = self._topics.get(key)
+        if lines is None:
+            lines = []
+            self._topics[key] = lines
+        self._topics.move_to_end(key)
+        lines.append(line)
+        self._trim(lines)
+        while len(self._topics) > self._max_topics:
+            self._topics.popitem(last=False)
+
+    def render(self, stream_id: Any, topic: Any) -> str:
+        """The buffered lines for one topic, oldest first; "" when none."""
+        lines = self._topics.get((str(stream_id), str(topic or "")))
+        if not lines:
+            return ""
+        return "\n".join(lines)
+
+    def _trim(self, lines: list[str]) -> None:
+        while len(lines) > self._max_messages:
+            lines.pop(0)
+        # Character budget: drop the oldest whole lines first, then truncate the
+        # oldest survivor if a single line still overshoots on its own.
+        while len(lines) > 1 and _joined_len(lines) > self._max_chars:
+            lines.pop(0)
+        if lines and len(lines[0]) > self._max_chars:
+            lines[0] = truncate_text(lines[0], self._max_chars)
+
+
+def _history_sort_key(message: dict) -> int:
+    """Integer message id for a stable oldest-first order; 0 when unusable."""
+    try:
+        return int(message.get("id"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _render_history_block(
+    messages: list[dict],
+    *,
+    max_messages: int,
+    window_hours: int,
+    max_chars: int,
+    now: Optional[float] = None,
+) -> str:
+    """Render the newest slice of ``messages`` as quoted history lines (#148).
+
+    Bounded on all three axes: at most ``max_messages`` lines, nothing older
+    than ``window_hours``, at most ``max_chars`` characters. The newest lines
+    win — oldest lines are dropped (and the oldest survivor truncated) so a
+    topic with months of history cannot blow up the context window.
+    """
+    if now is None:
+        now = time.time()
+    cutoff = now - window_hours * 3600
+
+    lines: list[str] = []
+    for message in sorted(messages, key=_history_sort_key):
+        timestamp = message.get("timestamp")
+        if isinstance(timestamp, (int, float)) and timestamp < cutoff:
+            continue
+        text = strip_html_to_text(str(message.get("content") or "")).strip()
+        if not text:
+            continue
+        sender = (
+            str(message.get("sender_full_name") or "").strip()
+            or str(message.get("sender_email") or "").strip()
+            or "Unknown"
+        )
+        lines.append(f"[{sender}] {text}")
+
+    lines = lines[-max_messages:]
+    while len(lines) > 1 and _joined_len(lines) > max_chars:
+        lines.pop(0)
+    if lines and len(lines[0]) > max_chars:
+        lines[0] = truncate_text(lines[0], max_chars)
+    return "\n".join(lines)
+
+
 def _message_with_flags(event: dict) -> dict:
     """Return the event's message with Zulip's per-user flags attached.
 
@@ -831,6 +1050,19 @@ class ZulipAdapter(BasePlatformAdapter):
 
         # Response prefix (Issue #65) — prepended to every outbound message
         self._response_prefix = _resolve_response_prefix()
+
+        # Soft gate + observe group (issue #153). Both off by default: with
+        # neither set, this adapter behaves exactly as it did before the flags
+        # existed. The observed buffer is in-adapter (not host session) state.
+        self._soft_gate = _resolve_soft_gate()
+        self._observe_group = _resolve_observe_group()
+        self._observed_context = ObservedContextBuffer()
+
+        # Bounded history-aware context (issue #148). "off" adds no round-trip.
+        self._history_mode = _resolve_history_mode()
+        self._history_max_messages = _resolve_int_setting("ZULIP_HISTORY_MAX_MESSAGES", 8)
+        self._history_window_hours = _resolve_int_setting("ZULIP_HISTORY_WINDOW_HOURS", 72)
+        self._history_max_chars = _resolve_int_setting("ZULIP_HISTORY_MAX_CHARS", 4000)
 
         # Rate limiter (per-sender, sliding window)
         self._rate_limiter = RateLimiter(
@@ -2019,6 +2251,146 @@ class ZulipAdapter(BasePlatformAdapter):
         )
         return name or "Unknown"
 
+    # ------------------------------------------------------------------
+    # Observed stream context and history harvest (#153, #148)
+    # ------------------------------------------------------------------
+
+    def _stream_monitored(self, stream_name: str) -> bool:
+        """Whether ``stream_name`` is inside ``ZULIP_STREAMS`` (all when unset)."""
+        if self._streams_filter is None:
+            return True
+        return stream_name.lower() in self._streams_filter
+
+    def _observe_stream_message(self, message: dict, content: str) -> None:
+        """Record a non-addressed stream message as topic context (#153).
+
+        No reply, no dispatch, no API call: the message joins a bounded
+        per-topic buffer that is prepended to the agent-facing text the next
+        time the bot is addressed in that topic. Self/bot messages are never
+        observed, and streams the bot does not monitor contribute nothing.
+        """
+        if not self._observe_group:
+            return
+        if message.get("type") != "stream":
+            return
+        if self._is_self_message(message):
+            return
+        stream_name = str(message.get("display_recipient") or "")
+        if not self._stream_monitored(stream_name):
+            return
+        text = strip_html_to_text(content or "").strip()
+        if not text:
+            return
+        sender = (
+            str(message.get("sender_full_name") or "").strip()
+            or str(message.get("sender_email") or "").strip()
+            or "Unknown"
+        )
+        topic = str(message.get("subject") or "")
+        self._observed_context.add(
+            message.get("stream_id"), topic, f"[{sender}] {text}"
+        )
+        logger.debug(
+            "zulip observed stream msg [stream=%s topic=%s]",
+            mask_pii(stream_name),
+            mask_pii(topic),
+        )
+
+    async def _quoted_topic_history(
+        self,
+        stream_name: str,
+        stream_id: Any,
+        topic: str,
+        *,
+        content: str,
+        addressed: bool,
+    ) -> str:
+        """Quoted context prepended to the agent-facing body for one turn.
+
+        Two independent sources: the observed-topic buffer (#153), which costs
+        nothing and only exists for a turn the bot was addressed in, and an
+        optional harvested slice of real topic history (#148). Both are
+        best-effort — a failed harvest is logged and dropped — and neither ever
+        reaches a slash command or a policy/rate-limit gate, which have already
+        been decided by the time this runs.
+        """
+        blocks: list[str] = []
+
+        if self._observe_group and addressed:
+            observed = self._observed_context.render(stream_id, topic)
+            if observed:
+                blocks.append(f"{OBSERVED_HISTORY_LABEL}\n{observed}")
+
+        if self._history_mode != "off" and (
+            self._history_mode == "always" or _history_intent_matches(content)
+        ):
+            harvested = await self._harvest_history_block(stream_name, topic)
+            if harvested:
+                blocks.append(f"{FETCHED_HISTORY_LABEL}\n{harvested}")
+
+        if not blocks:
+            return ""
+        return "\n\n".join(blocks) + "\n\n"
+
+    async def _fetch_stream_history(self, stream_name: str, topic: str) -> list[dict]:
+        """Narrow ``[stream, topic]`` fetch of the newest topic messages (#148).
+
+        The synchronous SDK call runs through ``_sdk_call`` so it is bounded
+        and cannot block the event loop. A non-success response yields an empty
+        list rather than an error.
+        """
+        narrow = [{"operator": "stream", "operand": stream_name}]
+        if topic:
+            narrow.append({"operator": "topic", "operand": topic})
+        result = await self._sdk_call(
+            self.client.get_messages,
+            {
+                "anchor": "newest",
+                "num_before": self._history_max_messages,
+                "num_after": 0,
+                "narrow": narrow,
+            },
+            timeout=HISTORY_FETCH_TIMEOUT,
+        )
+        if not isinstance(result, dict) or result.get("result") != "success":
+            return []
+        messages = result.get("messages")
+        return messages if isinstance(messages, list) else []
+
+    async def _harvest_history_block(self, stream_name: str, topic: str) -> str:
+        """Best-effort quoted slice of the real topic history (#148).
+
+        Streams/topics only — DMs have their own per-user sessions and are
+        never harvested across. Any error response or timeout is logged and
+        dropped, so a slow or failing Zulip API can never fail or unboundedly
+        delay a dispatch.
+        """
+        try:
+            messages = await asyncio.wait_for(
+                self._fetch_stream_history(stream_name, topic),
+                timeout=HISTORY_FETCH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "zulip history harvest timed out (dropped) [stream=%s topic=%s]",
+                mask_pii(stream_name),
+                mask_pii(topic),
+            )
+            return ""
+        except Exception as e:
+            logger.warning(
+                "zulip history harvest failed (dropped): %s", mask_pii(str(e))
+            )
+            return ""
+        if not messages:
+            return ""
+        return _render_history_block(
+            messages,
+            max_messages=self._history_max_messages,
+            window_hours=self._history_window_hours,
+            max_chars=self._history_max_chars,
+        )
+
     async def _handle_message(self, message: dict):
         """Process incoming Zulip message."""
         # Filter self-messages to prevent loops
@@ -2052,6 +2424,11 @@ class ZulipAdapter(BasePlatformAdapter):
 
         # Strip Zulip @-mention syntax and HTML
         content = strip_html_to_text(content)
+
+        # Whether the bot was actually named (or an onchar prefix fired). Only
+        # meaningful for stream messages; carried into event metadata under the
+        # soft gate (issue #153).
+        addressed = False
 
         # --- Reactions ---
         # Constructed here so the error path below can reach it, but not
@@ -2105,8 +2482,16 @@ class ZulipAdapter(BasePlatformAdapter):
             # and group policy below — the reaction is a trigger, never an
             # authorisation bypass.
             is_reaction_trigger = bool(message.get("_reaction_trigger"))
+            # ``addressed`` is the honest mention signal — the bot was named or
+            # an onchar prefix fired — independent of which mode decided to
+            # dispatch. ``ZULIP_SOFT_GATE`` dispatches every monitored stream
+            # message like onmessage but keeps that distinction in metadata so
+            # the agent can watch a stream it was not spoken to (issue #153).
             should_process = False
+            addressed = was_mentioned or onchar_triggered
             if is_reaction_trigger:
+                should_process = True
+            elif self._soft_gate:
                 should_process = True
             elif chatmode == "onmessage":
                 should_process = True
@@ -2115,9 +2500,11 @@ class ZulipAdapter(BasePlatformAdapter):
             elif chatmode == "onchar":
                 should_process = onchar_triggered or was_mentioned
 
-            # requireMention acts as additional gate (ignored in onmessage mode)
+            # requireMention acts as additional gate (ignored in onmessage mode
+            # and under the soft gate, which exists to dispatch everything).
             if (
                 not is_reaction_trigger
+                and not self._soft_gate
                 and chatmode != "onmessage"
                 and require_mention
                 and not was_mentioned
@@ -2146,6 +2533,10 @@ class ZulipAdapter(BasePlatformAdapter):
                 should_process = True
 
             if not should_process:
+                # Not addressed and not dispatched: keep it as topic context
+                # without ever replying (issue #153).
+                if msg_type == "stream" and self._observe_group and not addressed:
+                    self._observe_stream_message(message, content)
                 logger.debug("zulip drop [mode=%s, no trigger] msg=%s", chatmode, mask_pii(str(message_id)))
                 return
 
@@ -2405,6 +2796,10 @@ class ZulipAdapter(BasePlatformAdapter):
                     f"reaction :{message.get('_reaction_emoji', '?')}: — "
                     f"{message.get('_reaction_instruction', 'triggered')}"
                 )
+            if self._soft_gate:
+                # Only added under the soft gate, so with the flag off the event
+                # metadata is byte-identical to before (issue #153).
+                extra_meta["addressed"] = addressed
         else:
             sender_id = message.get("sender_id")
             chat_id = _private_chat_id(message)
@@ -2454,6 +2849,24 @@ class ZulipAdapter(BasePlatformAdapter):
             "session_gap_seconds": round(session_gap, 1),
             "topic_changed": topic_changed,
         })
+
+        # --- Quoted topic history (issues #153, #148) ---
+        #
+        # Appended to the agent-facing body only. Slash commands were handled
+        # and returned above, and every policy/rate-limit gate has already
+        # decided this turn, so quoted context can never change what the bot is
+        # allowed to answer or cost a round-trip on a message that is dropped.
+        # DMs are never harvested: their sessions are per-user and isolated.
+        if msg_type == "stream":
+            quoted = await self._quoted_topic_history(
+                stream_name,
+                stream_id,
+                topic,
+                content=content,
+                addressed=addressed,
+            )
+            if quoted:
+                content = quoted + content
 
         event = MessageEvent(
             text=content,
