@@ -839,16 +839,11 @@ class ZulipAdapter(BasePlatformAdapter):
         )
 
         # Persistent queue and dedupe
-        self._required_event_types = [
-            "message",
-            "update_message",
-            "delete_message",
-        ]
         self._queue_mgr = ZulipQueueManager(
             account_id=self.email or "default",
             data_dir=self._data_dir,
             register_fn=self._register_queue,
-            event_types=self._required_event_types,
+            needed_event_types_fn=self._needed_event_types,
         )
         self._dedupe = ZulipDedupeStore(
             account_id=self.email or "default",
@@ -872,6 +867,17 @@ class ZulipAdapter(BasePlatformAdapter):
 
         # Reaction config
         self._reaction_cfg = ReactionConfig.from_env()
+
+        # Extra Zulip event types beyond "message" that this install needs.
+        # Features opt in here (e.g. reaction triggers need "reaction"); it is
+        # consulted when registering the event queue and when deciding whether
+        # a persisted queue can be reused. (Issue #162)
+        self._extra_event_types: list = []
+        if _topic_sessions_enabled():
+            # Stable topic sessions need rename and topic-deletion events;
+            # opt in so a persisted queue whose subscription predates this
+            # set is re-registered (issue #162 machinery).
+            self._extra_event_types.extend(["update_message", "delete_message"])
 
         # DM policy engine (Issue #48 — controls who can DM the bot)
         self._policy = PolicyEngine(data_dir=self._data_dir)
@@ -1605,6 +1611,18 @@ class ZulipAdapter(BasePlatformAdapter):
             mask_pii(self.email),
         )
 
+    def _needed_event_types(self) -> list:
+        """Event types this adapter needs from its Zulip queue.
+
+        ``"message"`` is always required. Features that need more subscribe to
+        them through ``self._extra_event_types`` (for example reaction triggers
+        add ``"reaction"``), so installs that do not use those features request
+        nothing extra. A persisted queue is re-registered when this set changes,
+        because ``/register`` fixes ``event_types`` for the queue's whole
+        lifetime. (Issues #162, #149)
+        """
+        return ["message", *self._extra_event_types]
+
     def _register_queue(self) -> dict:
         """Register the event queue, learning the server's long-poll budget.
 
@@ -1616,11 +1634,7 @@ class ZulipAdapter(BasePlatformAdapter):
         idle poll with our shorter generic read timeout. (Issue #146)
         """
         result = self.client.register(
-            # Full subscription (message + update_message + delete_message):
-            # stable topic sessions need rename/deletion events; the queue
-            # manager validates the persisted subscription against
-            # ``event_types`` and re-registers on mismatch.
-            event_types=list(self._required_event_types),
+            event_types=self._needed_event_types(),
             fetch_event_id=0,
             fetch_event_types=["realm"],
         )

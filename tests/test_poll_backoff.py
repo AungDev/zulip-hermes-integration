@@ -32,6 +32,7 @@ from zulip.adapter import (
 def adapter(mock_platform_config, monkeypatch):
     import zulip.adapter as adapter_module
 
+    monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "true")
     monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
     monkeypatch.delenv("ZULIP_READ_TIMEOUT", raising=False)
 
