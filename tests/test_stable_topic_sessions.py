@@ -1969,6 +1969,44 @@ class TestSessionStartLabelsEndToEnd:
         )
 
     @pytest.mark.asyncio
+    async def test_listing_observes_new_generation_without_message_traffic(
+        self, adapter
+    ):
+        """``/new`` followed directly by ``/topic-sessions``: the fresh
+        generation has no record yet (``/new`` is core-handled — it never
+        reaches this adapter, and no message has been processed since),
+        so the listing must observe the live session before rendering
+        instead of falling back to the lineage origin (Topic261002-2)."""
+        await adapter._handle_message(_stream_msg("TopicA", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        adapter._handle_topic_update(_rename_event("TopicA", "TopicB"))
+        old_sid = "20260901_180238_1e8320d8"
+        store = _wire_sessions(adapter, {conv: (old_sid, [old_sid])})
+        future = (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).strftime("%Y%m%d_%H%M%S")
+        new_sid = f"{future}_d08790be"
+        # /new: the conversation's live session rotates — and no message
+        # is processed afterwards, only the listing check.
+        key = f"agent:main:zulip:stream:7:{conv}"
+        store._entries[key].session_id = new_sid
+        await adapter._handle_message(
+            _stream_msg("TopicB", msg_id=2, content="/topic-sessions")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        assert "📋 Sessions in this topic: 2" in reply
+        lines = [l for l in reply.split("\n") if "— started in" in l]
+        assert any(
+            f"`{new_sid}`" in l and 'started in "TopicB"' in l
+            for l in lines
+        )
+        assert any(
+            f"`{old_sid}`" in l and 'started in "TopicA"' in l
+            for l in lines
+        )
+
+    @pytest.mark.asyncio
     async def test_backfill_derives_labels_and_is_idempotent(self, adapter):
         await adapter._handle_message(_stream_msg("TopicA", msg_id=1))
         conv = adapter.handle_message.call_args[0][0].source.thread_id

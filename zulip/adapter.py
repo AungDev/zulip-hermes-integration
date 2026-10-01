@@ -2169,9 +2169,14 @@ class ZulipAdapter(BasePlatformAdapter):
     def _topic_sessions_command_reply(self, stream_id: int, topic: str) -> str:
         """``/topic-sessions`` (topic sessions): list this topic's session set.
 
-        Read-only listing: the current session plus every former session,
-        each labeled with the topic where it was created. Bindings are
-        not changed; ``/continue <session-id>`` (R7) switches.
+        Read-only for bindings: the current session plus every former
+        session, each labeled with the topic where it was created. The
+        only write is the first-sight start-label record (v6): ``/new``
+        is core-handled and never reaches this adapter, so a fresh
+        generation checked before any message traffic must be observed
+        here — otherwise its line falls back to the lineage origin
+        (Topic261002-2 case). Bindings are not changed;
+        ``/continue <session-id>`` (R7) switches.
         """
 
         if self._conversations is None:
@@ -2182,6 +2187,10 @@ class ZulipAdapter(BasePlatformAdapter):
         current_id, current_origin, members = self._conversations.sessions_for_topic(
             stream_id, topic
         )
+        # First sight counts here too (see docstring): observe the live
+        # session so its line below shows the name it was minted under.
+        if current_id is not None:
+            self._observe_session_start(stream_id, current_id)
 
         entries = self._route_entries()
         db = self._session_db()
