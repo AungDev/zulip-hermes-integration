@@ -1,5 +1,6 @@
 """Tests for zulip.version and zulip.updater."""
 
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -22,6 +23,18 @@ class TestVersionInfo:
         assert "adapter.py" in PLUGIN_FILES
         assert "version.py" in PLUGIN_FILES
         assert "plugin.yaml" in PLUGIN_FILES
+
+    def test_every_package_module_is_shipped(self):
+        """The self-updater only delivers files named in PLUGIN_FILES.
+
+        A module missing here would be left behind by an update while
+        adapter.py still imports it, so the plugin would not load
+        (PR review catch).
+        """
+        package_dir = Path(__file__).resolve().parent.parent / "zulip"
+        modules = {p.name for p in package_dir.glob("*.py")} | {"plugin.yaml"}
+        missing = modules - set(PLUGIN_FILES)
+        assert not missing, f"not shipped by the updater: {sorted(missing)}"
 
 
 class TestUpdaterCheck:

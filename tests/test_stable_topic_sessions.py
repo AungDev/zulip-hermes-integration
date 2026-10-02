@@ -18,8 +18,10 @@ import asyncio
 import contextlib
 import shutil
 import re
+import sqlite3
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -133,7 +135,7 @@ class TestRegistryStore:
         # record is a NULL-membership audit row — a recreated "deploys"
         # cannot adopt it (inheritance model).
         row = registry._conn.execute(
-            "SELECT topic_name FROM tombstones"
+            "SELECT topic_name FROM former_holders"
             " WHERE channel_id=7 AND conversation_id=?",
             (conv,),
         ).fetchone()
@@ -201,7 +203,7 @@ class TestRegistryStore:
         assert registry.current_name(7, conv) is None
         assert registry.lookup(7, "deploys") is None
         row = registry._conn.execute(
-            "SELECT topic_name FROM tombstones"
+            "SELECT topic_name FROM former_holders"
             " WHERE channel_id=7 AND conversation_id=?",
             (conv,),
         ).fetchone()
@@ -253,7 +255,7 @@ class TestRegistryStore:
         _cur, _org, members = registry.sessions_for_topic(7, "Discuss about XY")
         assert [m for m, _o in members] == [conv_f, conv_d]
         rows = registry._conn.execute(
-            "SELECT conversation_id FROM tombstones WHERE channel_id=7"
+            "SELECT conversation_id FROM former_holders WHERE channel_id=7"
         ).fetchall()
         assert {str(r[0]) for r in rows} == {conv_d, conv_f, conv_p}
 
@@ -266,7 +268,7 @@ class TestRegistryStore:
         with pytest.raises(sqlite3.IntegrityError):
             # Same conversation linked to a second topic name → rejected.
             registry._conn.execute(
-                "INSERT INTO topic_map"
+                "INSERT INTO live_holders"
                 " (account_id, channel_id, topic_name, conversation_id,"
                 "  anchor_message_id, updated_at) VALUES (?,?,?,?,NULL,?)",
                 (registry.account_id, 7, "TopicB", conv, 1.0),
@@ -1162,7 +1164,7 @@ class TestLegacySessionMigration:
         reg = adapter._conversations
         with reg._lock, reg._conn:
             reg._conn.execute(
-                "INSERT OR REPLACE INTO topic_map"
+                "INSERT OR REPLACE INTO live_holders"
                 " (account_id, channel_id, topic_name, conversation_id,"
                 "  origin_name, anchor_message_id, updated_at)"
                 " VALUES (?,?,?,?,?,NULL,?)",
@@ -1243,7 +1245,7 @@ class TestLegacySessionMigration:
         reg = adapter._conversations
         with reg._lock, reg._conn:
             reg._conn.execute(
-                "INSERT OR REPLACE INTO topic_map"
+                "INSERT OR REPLACE INTO live_holders"
                 " (account_id, channel_id, topic_name, conversation_id,"
                 "  origin_name, anchor_message_id, updated_at)"
                 " VALUES (?,?,?,?,?,NULL,?)",
@@ -1256,7 +1258,7 @@ class TestLegacySessionMigration:
 
     def test_orphaned_conversation_key_is_skipped_on_re_enable(self, adapter):
         # Re-enable after an observed topic deletion: the orphaned
-        # conversation has no topic_map row but IS recorded as an orphaned
+        # conversation has no live_holders row but IS recorded as an orphaned
         # audit row — its conv-keyed session must be skipped, not re-minted
         # (a recreated topic starts fresh per R4).
         conv = adapter._conversations.resolve(7, "Gone Topic")
@@ -1670,7 +1672,7 @@ class TestIdShapedTopicNameProbe:
         real mints are random; this forces the adversarial coincidence)."""
         with reg._lock, reg._conn:
             reg._conn.execute(
-                "INSERT INTO topic_map (account_id, channel_id, topic_name,"
+                "INSERT INTO live_holders (account_id, channel_id, topic_name,"
                 " conversation_id, origin_name, anchor_message_id, updated_at)"
                 " VALUES (?,?,?,?,?,NULL,?)",
                 (reg.account_id, 7, self.HELD_TOPIC, self.ID_SHAPED,
@@ -1727,3 +1729,302 @@ class TestIdShapedTopicNameProbe:
         # ...and the id-shaped topic still routes to its own session.
         await adapter._handle_message(_stream_msg(self.ID_SHAPED, msg_id=3))
         assert adapter.handle_message.call_args[0][0].source.thread_id == fresh
+
+
+class TestSessionStartLabels:
+    """Per-session start labels (v6): every gateway session is labeled with
+    the topic name it was actually created under — not the lineage origin,
+    which only matches until the first rename between generations."""
+
+    def test_session_start_first_record_wins(self, registry):
+        conv = registry.resolve(7, "TopicA")
+        registry.record_session_start(
+            7, conv, "20260901_120000_aaaa", started_in="OldName"
+        )
+        # A later write must not relabel an existing record.
+        registry.record_session_start(
+            7, conv, "20260901_120000_aaaa", started_in="NewName"
+        )
+        assert registry.session_start(7, "20260901_120000_aaaa") == "OldName"
+        # Unknown session -> no record.
+        assert registry.session_start(7, "20260101_000000_zzzz") is None
+
+    def test_derive_session_start_tracks_last_mapping_change(self, registry):
+        conv = registry.resolve(7, "TopicA")
+        future = (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).strftime("%Y%m%d_%H%M%S")
+        # A session created after the last mapping change was created
+        # under the CURRENT name.
+        assert (
+            registry.derive_session_start(7, conv, f"{future}_bbbb") == "TopicA"
+        )
+        registry.repoint(7, "TopicA", "TopicB")
+        assert (
+            registry.derive_session_start(7, conv, f"{future}_bbbb") == "TopicB"
+        )
+        # A session predating every tracked change falls back to the
+        # lineage origin (the one-time approximation).
+        assert (
+            registry.derive_session_start(7, conv, "20260101_120000_cccc")
+            == "TopicA"
+        )
+
+    def test_schema_v5_upgrades_in_place(self, tmp_path):
+        """A v5 registry upgrades additively through v6 (labels) and v7
+        (rename): data preserved, no drop, no re-mint, no continuity
+        loss."""
+        db_path = tmp_path / "zulip_conversations_x.db"
+        db = sqlite3.connect(str(db_path))
+        db.execute(
+            "CREATE TABLE topic_map ("
+            " account_id TEXT NOT NULL, channel_id INTEGER NOT NULL,"
+            " topic_name TEXT NOT NULL, conversation_id TEXT NOT NULL,"
+            " origin_name TEXT NOT NULL, anchor_message_id INTEGER,"
+            " updated_at REAL NOT NULL,"
+            " PRIMARY KEY (account_id, channel_id, topic_name))"
+        )
+        db.execute(
+            "CREATE UNIQUE INDEX idx_topic_map_conversation ON topic_map"
+            " (account_id, channel_id, conversation_id)"
+        )
+        db.execute(
+            "CREATE TABLE tombstones ("
+            " account_id TEXT NOT NULL, channel_id INTEGER NOT NULL,"
+            " conversation_id TEXT NOT NULL, topic_name TEXT,"
+            " origin_name TEXT NOT NULL, last_topic TEXT,"
+            " freed_at REAL NOT NULL,"
+            " PRIMARY KEY (account_id, channel_id, conversation_id))"
+        )
+        db.execute(
+            "INSERT INTO topic_map VALUES"
+            " ('x', 7, 'Keep', 'cabc1234567890', 'Keep', NULL, 1.0)"
+        )
+        db.execute("PRAGMA user_version = 5")
+        db.commit()
+        db.close()
+
+        reg = TopicConversationRegistry(account_id="x", data_dir=str(tmp_path))
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        tables = {
+            r[0]
+            for r in reg._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "live_holders" in tables and "former_holders" in tables
+        assert "topic_map" not in tables and "tombstones" not in tables
+        # v5 data survives the upgrade untouched.
+        assert reg.lookup(7, "Keep") == "cabc1234567890"
+        # And the label store is live.
+        reg.record_session_start(
+            7, "cabc1234567890", "20260901_120000_aaaa", started_in="Keep"
+        )
+        assert reg.session_start(7, "20260901_120000_aaaa") == "Keep"
+
+
+    def test_v6_rename_preserves_every_row(self, tmp_path):
+        """The live-db path: a v6 registry (old table names) upgrades to
+        v7 by metadata-only rename — every row survives, and the
+        uniqueness constraints still hold under the new names."""
+        db_path = tmp_path / "zulip_conversations_x.db"
+        db = sqlite3.connect(str(db_path))
+        db.execute(
+            "CREATE TABLE topic_map ("
+            " account_id TEXT NOT NULL, channel_id INTEGER NOT NULL,"
+            " topic_name TEXT NOT NULL, conversation_id TEXT NOT NULL,"
+            " origin_name TEXT NOT NULL, anchor_message_id INTEGER,"
+            " updated_at REAL NOT NULL,"
+            " PRIMARY KEY (account_id, channel_id, topic_name))"
+        )
+        db.execute(
+            "CREATE UNIQUE INDEX idx_topic_map_conversation ON topic_map"
+            " (account_id, channel_id, conversation_id)"
+        )
+        db.execute(
+            "CREATE TABLE tombstones ("
+            " account_id TEXT NOT NULL, channel_id INTEGER NOT NULL,"
+            " conversation_id TEXT NOT NULL, topic_name TEXT,"
+            " origin_name TEXT NOT NULL, last_topic TEXT,"
+            " freed_at REAL NOT NULL,"
+            " PRIMARY KEY (account_id, channel_id, conversation_id))"
+        )
+        db.execute(
+            "CREATE TABLE session_starts ("
+            " account_id TEXT NOT NULL, channel_id INTEGER NOT NULL,"
+            " conversation_id TEXT NOT NULL, session_id TEXT NOT NULL,"
+            " started_in TEXT NOT NULL, recorded_at REAL NOT NULL,"
+            " PRIMARY KEY (account_id, channel_id, session_id))"
+        )
+        db.execute(
+            "INSERT INTO topic_map VALUES"
+            " ('x', 7, 'Keep', 'cabc1234567890', 'OldName', 11, 1.0)"
+        )
+        db.execute(
+            "INSERT INTO tombstones VALUES"
+            " ('x', 7, 'cdef0987654321', 'Keep', 'cdef0987654321',"
+            "  'Keep', 2.0)"
+        )
+        db.execute(
+            "INSERT INTO session_starts VALUES"
+            " ('x', 7, 'cabc1234567890', '20260901_120000_aaaa',"
+            "  'Keep', 3.0)"
+        )
+        db.execute("PRAGMA user_version = 6")
+        db.commit()
+        db.close()
+
+        reg = TopicConversationRegistry(account_id="x", data_dir=str(tmp_path))
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        tables = {
+            r[0]
+            for r in reg._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "live_holders" in tables and "former_holders" in tables
+        assert "topic_map" not in tables and "tombstones" not in tables
+        indexes = {
+            r[0]
+            for r in reg._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        assert "idx_live_holders_conversation" in indexes
+        assert "idx_topic_map_conversation" not in indexes
+        # Rows survive untouched.
+        assert reg.lookup(7, "Keep") == "cabc1234567890"
+        cur, origin, members = reg.sessions_for_topic(7, "Keep")
+        assert cur == "cabc1234567890" and origin == "OldName"
+        assert members == [("cdef0987654321", "cdef0987654321")]
+        assert reg.session_start(7, "20260901_120000_aaaa") == "Keep"
+        # The conversation-uniqueness constraint still holds post-rename.
+        with pytest.raises(sqlite3.IntegrityError):
+            reg._conn.execute(
+                "INSERT INTO live_holders VALUES"
+                " ('x', 7, 'Other', 'cabc1234567890', 'Other', NULL, 4.0)"
+            )
+
+
+class TestSessionStartLabelsEndToEnd:
+    """The user's case: topic renamed between generations — each session
+    keeps the name it was minted under."""
+
+    @pytest.mark.asyncio
+    async def test_started_in_tracks_session_mint_not_lineage_origin(
+        self, adapter
+    ):
+        await adapter._handle_message(_stream_msg("Topic261001-1", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        adapter._handle_topic_update(
+            _rename_event("Topic261001-1", "Topic261001-2")
+        )
+        # New generation minted AFTER the rename: its id timestamp
+        # postdates the conversation's last mapping change.
+        future = (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).strftime("%Y%m%d_%H%M%S")
+        new_sid = f"{future}_88125928"
+        old_sid = "20260901_133036_4cd2432d"
+        _wire_sessions(adapter, {conv: (new_sid, [old_sid, new_sid])})
+        await adapter._handle_message(_stream_msg("Topic261001-2", msg_id=2))
+        adapter.handle_message.reset_mock()
+        await adapter._handle_message(
+            _stream_msg("Topic261001-2", msg_id=3, content="/topic-sessions")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        assert "📋 Sessions in this topic: 2" in reply
+        lines = [l for l in reply.split("\n") if "— started in" in l]
+        # The post-rename generation is labeled with the name it was
+        # minted under; the pre-rename generation keeps its own.
+        assert any(
+            f"`{new_sid}`" in l and 'started in "Topic261001-2"' in l
+            for l in lines
+        )
+        assert any(
+            f"`{old_sid}`" in l and 'started in "Topic261001-1"' in l
+            for l in lines
+        )
+        # Labels differ per session — not one lineage origin for both.
+        assert 'started in "Topic261001-1"' in reply
+        assert 'started in "Topic261001-2"' in reply
+
+    @pytest.mark.asyncio
+    async def test_message_observation_records_new_generation(self, adapter):
+        await adapter._handle_message(_stream_msg("TopicA", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        store = _wire_sessions(
+            adapter, {conv: ("20260901_120000_aaaa", ["20260901_120000_aaaa"])}
+        )
+        # /new: the conversation's live session changes.
+        key = f"agent:main:zulip:stream:7:{conv}"
+        store._entries[key].session_id = "20260901_130000_bbbb"
+        await adapter._handle_message(_stream_msg("TopicA", msg_id=2))
+        # First sight of the new generation recorded its start label.
+        assert (
+            adapter._conversations.session_start(7, "20260901_130000_bbbb")
+            == "TopicA"
+        )
+
+    @pytest.mark.asyncio
+    async def test_listing_observes_new_generation_without_message_traffic(
+        self, adapter
+    ):
+        """``/new`` followed directly by ``/topic-sessions``: the fresh
+        generation has no record yet (``/new`` is core-handled — it never
+        reaches this adapter, and no message has been processed since),
+        so the listing must observe the live session before rendering
+        instead of falling back to the lineage origin (Topic261002-2)."""
+        await adapter._handle_message(_stream_msg("TopicA", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        adapter._handle_topic_update(_rename_event("TopicA", "TopicB"))
+        old_sid = "20260901_180238_1e8320d8"
+        store = _wire_sessions(adapter, {conv: (old_sid, [old_sid])})
+        future = (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).strftime("%Y%m%d_%H%M%S")
+        new_sid = f"{future}_d08790be"
+        # /new: the conversation's live session rotates — and no message
+        # is processed afterwards, only the listing check.
+        key = f"agent:main:zulip:stream:7:{conv}"
+        store._entries[key].session_id = new_sid
+        await adapter._handle_message(
+            _stream_msg("TopicB", msg_id=2, content="/topic-sessions")
+        )
+        reply = adapter.client._client._sent_messages[0]["content"]
+        assert "📋 Sessions in this topic: 2" in reply
+        lines = [l for l in reply.split("\n") if "— started in" in l]
+        assert any(
+            f"`{new_sid}`" in l and 'started in "TopicB"' in l
+            for l in lines
+        )
+        assert any(
+            f"`{old_sid}`" in l and 'started in "TopicA"' in l
+            for l in lines
+        )
+
+    @pytest.mark.asyncio
+    async def test_backfill_derives_labels_and_is_idempotent(self, adapter):
+        await adapter._handle_message(_stream_msg("TopicA", msg_id=1))
+        conv = adapter.handle_message.call_args[0][0].source.thread_id
+        adapter.handle_message.reset_mock()
+        _wire_sessions(
+            adapter,
+            {conv: ("20260901_140000_dddd",
+                    ["20260901_120000_aaaa", "20260901_140000_dddd"])},
+        )
+        # Wiring ran the backfill: both generations carry a label (the
+        # origin here — neither postdates the last mapping change).
+        assert (
+            adapter._conversations.session_start(7, "20260901_120000_aaaa")
+            == "TopicA"
+        )
+        assert (
+            adapter._conversations.session_start(7, "20260901_140000_dddd")
+            == "TopicA"
+        )
+        # Idempotent: a second run records nothing new.
+        assert adapter._backfill_session_starts() == 0

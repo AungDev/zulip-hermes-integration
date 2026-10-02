@@ -39,10 +39,25 @@ import sqlite3
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _session_created_at(session_id: str) -> Optional[float]:
+    """Epoch seconds parsed from a gateway session id, if shaped like one.
+
+    Gateway session ids embed their creation time (``YYYYMMDD_HHMMSS_hex``).
+    Returns ``None`` for ids that do not match the shape.
+    """
+    try:
+        date_part, time_part, _rest = str(session_id).split("_", 2)
+        stamp = datetime.strptime(f"{date_part}_{time_part}", "%Y%m%d_%H%M%S")
+    except (ValueError, AttributeError):
+        return None
+    return stamp.replace(tzinfo=timezone.utc).timestamp()
 
 
 def _new_conversation_id() -> str:
@@ -72,24 +87,63 @@ class TopicConversationRegistry:
         safe_id = "".join(c if c.isalnum() else "_" for c in self.account_id)
         return self._data_dir / f"zulip_conversations_{safe_id}.db"
 
+    def _table_exists(self, name: str) -> bool:
+        """Whether a table exists in this registry database."""
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
     def _init_schema(self) -> None:
         with self._lock, self._conn:
-            # Schema v4: tombstone membership (topic_name) becomes nullable.
-            # NULL = ORPHANED — the session set has no beneficiary (topic
-            # deleted without rename, cross-channel move) and is unreachable
-            # by /continue from any topic, per the inheritance model: a
-            # topic only owns sessions it created or received via full
-            # rename (merge). v3 added origin_name to both tables; v2 the
-            # per-conversation tombstone key and the topic/session unique
-            # index.
+            # Schema v4: former-holder membership (topic_name) becomes
+            # nullable. NULL = ORPHANED — the session set has no
+            # beneficiary (topic deleted without rename, cross-channel
+            # move) and is unreachable by /continue from any topic, per
+            # the inheritance model: a topic only owns sessions it created
+            # or received via full rename (merge). v3 added origin_name to
+            # both tables; v2 the per-conversation former-holder key and
+            # the topic/session unique index. v5: the stable mapping pair
+            # (schemas below v5 are pre-release dev shapes and are
+            # rebuilt). v6 (additive): session_starts — per-session start
+            # labels. v7 (metadata-only rename): topic_map renamed to
+            # live_holders, tombstones renamed to former_holders.
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version < 5:
-                self._conn.execute("DROP TABLE IF EXISTS topic_map")
-                self._conn.execute("DROP TABLE IF EXISTS tombstones")
-                self._conn.execute("PRAGMA user_version = 5")
+                # Pre-release dev shapes: rebuilt from scratch.
+                for table in (
+                    "topic_map",
+                    "tombstones",
+                    "session_starts",
+                    "live_holders",
+                    "former_holders",
+                ):
+                    self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+                version = 5
+            if 5 <= version < 7:
+                # v7 (metadata-only rename): carry v5/v6 databases over
+                # without touching a single row. The old names suggested
+                # members lived in topic_map and only orphans in
+                # tombstones; the new pair states the split — the live
+                # holder per name vs the conversations that formerly
+                # held one.
+                if self._table_exists("topic_map"):
+                    self._conn.execute(
+                        "ALTER TABLE topic_map RENAME TO live_holders"
+                    )
+                if self._table_exists("tombstones"):
+                    self._conn.execute(
+                        "ALTER TABLE tombstones RENAME TO former_holders"
+                    )
+                # The unique index follows the renamed table under its
+                # old name; recreate it under the matching new name.
+                self._conn.execute(
+                    "DROP INDEX IF EXISTS idx_topic_map_conversation"
+                )
             self._conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS topic_map (
+                CREATE TABLE IF NOT EXISTS live_holders (
                   account_id      TEXT NOT NULL,
                   channel_id      INTEGER NOT NULL,
                   topic_name      TEXT NOT NULL,
@@ -103,13 +157,13 @@ class TopicConversationRegistry:
             )
             self._conn.execute(
                 """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_topic_map_conversation
-                  ON topic_map (account_id, channel_id, conversation_id)
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_live_holders_conversation
+                  ON live_holders (account_id, channel_id, conversation_id)
                 """
             )
             self._conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS tombstones (
+                CREATE TABLE IF NOT EXISTS former_holders (
                   account_id      TEXT NOT NULL,
                   channel_id      INTEGER NOT NULL,
                   conversation_id TEXT NOT NULL,
@@ -121,6 +175,27 @@ class TopicConversationRegistry:
                 )
                 """
             )
+            # v6 (additive for v5): per-session start labels — the topic
+            # name where each gateway session was created. The listing
+            # labels every session with its own start rather than the
+            # lineage's origin (which only matches until the first rename
+            # between generations). Missing records fall back to the
+            # lineage origin, so existing data keeps working.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_starts (
+                  account_id      TEXT NOT NULL,
+                  channel_id      INTEGER NOT NULL,
+                  conversation_id TEXT NOT NULL,
+                  session_id      TEXT NOT NULL,
+                  started_in      TEXT NOT NULL,
+                  recorded_at     REAL NOT NULL,
+                  PRIMARY KEY (account_id, channel_id, session_id)
+                )
+                """
+            )
+            if version < 7:
+                self._conn.execute("PRAGMA user_version = 7")
 
     # -- R1 ----------------------------------------------------------------
 
@@ -139,7 +214,7 @@ class TopicConversationRegistry:
 
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT conversation_id FROM topic_map"
+                "SELECT conversation_id FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             ).fetchone()
@@ -147,14 +222,14 @@ class TopicConversationRegistry:
                 return str(row[0])
 
             conversation_id = _new_conversation_id()
-            # NOTE: no tombstone purge here — none is needed. Tombstone
-            # membership follows the beneficiary of a rename (or is NULL
-            # for orphaned sessions), never the freed name, so a reused
-            # label cannot accidentally adopt a previous lineage: under
-            # the inheritance model the reused name simply starts a fresh
-            # conversation (R4).
+            # NOTE: no former_holders purge here — none is needed.
+            # Former-holder membership follows the beneficiary of a
+            # rename (or is NULL for orphaned sessions), never the freed
+            # name, so a reused label cannot accidentally adopt a
+            # previous lineage: under the inheritance model the reused
+            # name simply starts a fresh conversation (R4).
             self._conn.execute(
-                "INSERT INTO topic_map"
+                "INSERT INTO live_holders"
                 " (account_id, channel_id, topic_name, conversation_id,"
                 "  origin_name, anchor_message_id, updated_at)"
                 " VALUES (?,?,?,?,?,?,?)",
@@ -193,7 +268,7 @@ class TopicConversationRegistry:
         with self._lock, self._conn:
             row = self._conn.execute(
                 "SELECT conversation_id, anchor_message_id, origin_name"
-                " FROM topic_map"
+                " FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, old_name),
             ).fetchone()
@@ -205,28 +280,29 @@ class TopicConversationRegistry:
             now = time.time()
 
             # Carry the topic's former sessions along with the rename:
-            # tombstones tagged with the old name keep belonging to this
-            # topic under its new name (origin_name is never renamed).
+            # former_holders rows tagged with the old name keep belonging
+            # to this topic under its new name (origin_name is never
+            # renamed).
             self._conn.execute(
-                "UPDATE tombstones SET topic_name=?"
+                "UPDATE former_holders SET topic_name=?"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (new_name, self.account_id, channel_id, old_name),
             )
 
             # Displace any live mapping under the new name (R5).
             displaced = self._conn.execute(
-                "SELECT conversation_id, origin_name FROM topic_map"
+                "SELECT conversation_id, origin_name FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, new_name),
             ).fetchone()
             if displaced is not None and str(displaced[0]) != conversation_id:
                 self._conn.execute(
-                    "DELETE FROM topic_map"
+                    "DELETE FROM live_holders"
                     " WHERE account_id=? AND channel_id=? AND topic_name=?",
                     (self.account_id, channel_id, new_name),
                 )
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO tombstones"
+                    "INSERT OR REPLACE INTO former_holders"
                     " (account_id, channel_id, topic_name, conversation_id,"
                     "  origin_name, last_topic, freed_at)"
                     " VALUES (?,?,?,?,?,?,?)",
@@ -250,12 +326,12 @@ class TopicConversationRegistry:
             # must never become a /continue candidate for a recreated
             # old-name topic (a held session cannot be taken).
             self._conn.execute(
-                "DELETE FROM topic_map"
+                "DELETE FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, old_name),
             )
             self._conn.execute(
-                "INSERT OR REPLACE INTO tombstones"
+                "INSERT OR REPLACE INTO former_holders"
                 " (account_id, channel_id, topic_name, conversation_id,"
                 "  origin_name, last_topic, freed_at) VALUES (?,?,NULL,?,?,?,?)",
                 (
@@ -272,7 +348,7 @@ class TopicConversationRegistry:
             # Map the new name to the same conversation, preserving the
             # conversation's anchor message id and origin.
             self._conn.execute(
-                "INSERT OR REPLACE INTO topic_map"
+                "INSERT OR REPLACE INTO live_holders"
                 " (account_id, channel_id, topic_name, conversation_id,"
                 "  origin_name, anchor_message_id, updated_at)"
                 " VALUES (?,?,?,?,?,?,?)",
@@ -298,7 +374,7 @@ class TopicConversationRegistry:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT topic_name FROM topic_map"
+                "SELECT topic_name FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND conversation_id=?",
                 (self.account_id, channel_id, conversation_id),
             ).fetchone()
@@ -313,7 +389,7 @@ class TopicConversationRegistry:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT conversation_id FROM topic_map"
+                "SELECT conversation_id FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             ).fetchone()
@@ -322,9 +398,9 @@ class TopicConversationRegistry:
     def last_topic_of(self, channel_id: int, conversation_id: str) -> Optional[str]:
         """The conversation's LAST known topic name (NULL when unknown).
 
-        Read from the conversation's own tombstone row — written at every
-        rebind/repoint and at orphan/free time, so it reflects the topic
-        the conversation most recently lived in. Used by outbound routing
+        Read from the conversation's own former_holders row — written at
+        every rebind/repoint and at orphan/free time, so it reflects the
+        topic the conversation most recently lived in. Used by outbound routing
         when the conversation is no longer live (R8/R10 orphan): the
         in-flight reply lands on the topic where the conversation was last
         seen instead of materializing a ghost topic named like the id.
@@ -332,7 +408,7 @@ class TopicConversationRegistry:
 
         with self._lock:
             row = self._conn.execute(
-                "SELECT last_topic FROM tombstones"
+                "SELECT last_topic FROM former_holders"
                 " WHERE account_id=? AND channel_id=? AND conversation_id=?",
                 (self.account_id, channel_id, conversation_id),
             ).fetchone()
@@ -340,7 +416,7 @@ class TopicConversationRegistry:
 
     def has_conversation(self, channel_id: int, conversation_id: str) -> bool:
         """Whether a conversation id is known to this registry — live
-        (topic_map) or recorded as a former/orphaned row (tombstones).
+        (live_holders) or recorded as a former/orphaned row (former_holders).
 
         Used by the upgrade migration to tell an already-migrated
         conv-keyed session key from a legacy name-keyed key whose topic
@@ -348,7 +424,7 @@ class TopicConversationRegistry:
         """
 
         with self._lock:
-            for table in ("topic_map", "tombstones"):
+            for table in ("live_holders", "former_holders"):
                 row = self._conn.execute(
                     f"SELECT 1 FROM {table}"
                     " WHERE account_id=? AND channel_id=? AND conversation_id=?",
@@ -373,9 +449,9 @@ class TopicConversationRegistry:
             now = time.time()
 
             # Remember the conversation's origin: from its live row, or
-            # from its tombstone if it is currently detached.
+            # from its former_holders row if it is currently detached.
             live = self._conn.execute(
-                "SELECT topic_name, origin_name FROM topic_map"
+                "SELECT topic_name, origin_name FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND conversation_id=?",
                 (self.account_id, channel_id, conversation_id),
             ).fetchone()
@@ -383,7 +459,7 @@ class TopicConversationRegistry:
                 origin_name = str(live[1])
             else:
                 trow = self._conn.execute(
-                    "SELECT origin_name FROM tombstones"
+                    "SELECT origin_name FROM former_holders"
                     " WHERE account_id=? AND channel_id=? AND conversation_id=?",
                     (self.account_id, channel_id, conversation_id),
                 ).fetchone()
@@ -391,18 +467,18 @@ class TopicConversationRegistry:
 
             # Displace any live mapping at the target name (R5).
             displaced = self._conn.execute(
-                "SELECT conversation_id, origin_name FROM topic_map"
+                "SELECT conversation_id, origin_name FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             ).fetchone()
             if displaced is not None and str(displaced[0]) != conversation_id:
                 self._conn.execute(
-                    "DELETE FROM topic_map"
+                    "DELETE FROM live_holders"
                     " WHERE account_id=? AND channel_id=? AND topic_name=?",
                     (self.account_id, channel_id, topic_name),
                 )
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO tombstones"
+                    "INSERT OR REPLACE INTO former_holders"
                     " (account_id, channel_id, topic_name, conversation_id,"
                     "  origin_name, last_topic, freed_at)"
                     " VALUES (?,?,?,?,?,?,?)",
@@ -422,25 +498,25 @@ class TopicConversationRegistry:
 
             # Move out of any other live topic (the session belongs to
             # exactly one topic at a time). The departed topic keeps the
-            # conversation as a tombstoned former session.
+            # conversation as a former session.
             other_name: Optional[str] = None
             if live is not None and str(live[0]) != topic_name:
                 other_name = str(live[0])
                 self._conn.execute(
-                    "DELETE FROM topic_map"
+                    "DELETE FROM live_holders"
                     " WHERE account_id=? AND channel_id=? AND topic_name=?"
                     "   AND conversation_id=?",
                     (self.account_id, channel_id, other_name, conversation_id),
                 )
 
-            # Consume the conversation's tombstones (it is live again).
+            # Consume the conversation's former_holders rows (it is live again).
             self._conn.execute(
-                "DELETE FROM tombstones"
+                "DELETE FROM former_holders"
                 " WHERE account_id=? AND channel_id=? AND conversation_id=?",
                 (self.account_id, channel_id, conversation_id),
             )
             self._conn.execute(
-                "INSERT OR REPLACE INTO topic_map"
+                "INSERT OR REPLACE INTO live_holders"
                 " (account_id, channel_id, topic_name, conversation_id,"
                 "  origin_name, anchor_message_id, updated_at)"
                 " VALUES (?,?,?,?,?,NULL,?)",
@@ -453,11 +529,11 @@ class TopicConversationRegistry:
                     now,
                 ),
             )
-            # Written after the consumption above so the move-tombstone
+            # Written after the consumption above so the move record
             # itself survives.
             if other_name is not None:
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO tombstones"
+                    "INSERT OR REPLACE INTO former_holders"
                     " (account_id, channel_id, topic_name, conversation_id,"
                     "  origin_name, last_topic, freed_at)"
                     " VALUES (?,?,?,?,?,?,?)",
@@ -480,7 +556,7 @@ class TopicConversationRegistry:
         """The topic's session set for the ``/topic-sessions`` listing (read-only).
 
         Returns ``(current_id, current_origin, members)`` where members are
-        the tombstoned former sessions of this topic,
+        the former sessions of this topic,
         ``[(conversation_id, origin_name), ...]``, most recent first.
         ``origin_name`` is the topic where the session was created and is
         never renamed; ``topic_name`` tracks membership and is carried
@@ -489,7 +565,7 @@ class TopicConversationRegistry:
 
         with self._lock:
             row = self._conn.execute(
-                "SELECT conversation_id, origin_name FROM topic_map"
+                "SELECT conversation_id, origin_name FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             ).fetchone()
@@ -497,7 +573,7 @@ class TopicConversationRegistry:
             members = [
                 (str(r[0]), str(r[1]))
                 for r in self._conn.execute(
-                    "SELECT conversation_id, origin_name FROM tombstones"
+                    "SELECT conversation_id, origin_name FROM former_holders"
                     " WHERE account_id=? AND channel_id=? AND topic_name=?"
                     " ORDER BY freed_at DESC, rowid DESC",
                     (self.account_id, channel_id, topic_name),
@@ -511,11 +587,109 @@ class TopicConversationRegistry:
 
     # -- R10 (deletion / orphaning) -----------------------------------------
 
+    def iter_conversations(self) -> List[Tuple[int, str]]:
+        """Every live conversation as ``(channel_id, conversation_id)``."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT channel_id, conversation_id FROM live_holders"
+                " WHERE account_id=?",
+                (self.account_id,),
+            ).fetchall()
+        return [(int(r[0]), str(r[1])) for r in rows]
+
+    # -- session start labels (v6) -----------------------------------------
+
+    def record_session_start(
+        self,
+        channel_id: int,
+        conversation_id: str,
+        session_id: str,
+        started_in: Optional[str] = None,
+    ) -> None:
+        """Record where a gateway session started (INSERT OR IGNORE).
+
+        First record wins — a session is never relabeled after the fact.
+        ``started_in`` defaults to the derived start (see
+        :meth:`derive_session_start`); nothing is written when no label
+        can be determined.
+        """
+        if started_in is None:
+            started_in = self.derive_session_start(
+                channel_id, conversation_id, session_id
+            )
+        if not started_in:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO session_starts"
+                " (account_id, channel_id, conversation_id, session_id,"
+                "  started_in, recorded_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (
+                    self.account_id,
+                    channel_id,
+                    conversation_id,
+                    session_id,
+                    started_in,
+                    time.time(),
+                ),
+            )
+
+    def session_start(
+        self, channel_id: int, session_id: str
+    ) -> Optional[str]:
+        """The recorded start label for a gateway session, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT started_in FROM session_starts"
+                " WHERE account_id=? AND channel_id=? AND session_id=?",
+                (self.account_id, channel_id, session_id),
+            ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def derive_session_start(
+        self, channel_id: int, conversation_id: str, session_id: str
+    ) -> Optional[str]:
+        """Best-effort start label for a session with no record yet.
+
+        The gateway session id embeds its creation time. If the session
+        was created after the conversation's last mapping change
+        (``updated_at`` moves only on mapping writes: mint, rename,
+        merge), it must have been created under the current name;
+        otherwise it predates every tracked change and the lineage origin
+        is the best available label. Pre-tracking history is not
+        recoverable for anyone — a one-time approximation for sessions
+        minted before the labels existed.
+        """
+        created = _session_created_at(session_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT topic_name, origin_name, updated_at FROM live_holders"
+                " WHERE account_id=? AND channel_id=? AND conversation_id=?",
+                (self.account_id, channel_id, conversation_id),
+            ).fetchone()
+            if row is None:
+                tomb = self._conn.execute(
+                    "SELECT origin_name FROM former_holders"
+                    " WHERE account_id=? AND channel_id=? AND"
+                    " conversation_id=?",
+                    (self.account_id, channel_id, conversation_id),
+                ).fetchone()
+                return str(tomb[0]) if tomb is not None else None
+        topic_name, origin_name, updated_at = (
+            str(row[0]),
+            str(row[1]),
+            float(row[2]),
+        )
+        if created is not None and created > updated_at:
+            return topic_name
+        return origin_name
+
     def orphan_topic_sessions(self, channel_id: int, topic_name: str) -> int:
         """Topic deleted without rename/merge (R10): no beneficiary.
 
-        Removes the live mapping WITHOUT a successor tombstone and marks
-        every former-session tombstone of this topic orphaned
+        Removes the live mapping WITHOUT a successor record and marks
+        every former-session record of this topic orphaned
         (``topic_name = NULL``). The orphaned live conversation itself is
         recorded as an orphaned row (membership NULL, origin preserved),
         so it stays auditable and the upgrade migration can still
@@ -528,17 +702,17 @@ class TopicConversationRegistry:
 
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT conversation_id, origin_name FROM topic_map"
+                "SELECT conversation_id, origin_name FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             ).fetchone()
             self._conn.execute(
-                "DELETE FROM topic_map"
+                "DELETE FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             )
             cur = self._conn.execute(
-                "UPDATE tombstones SET topic_name=NULL, last_topic=?"
+                "UPDATE former_holders SET topic_name=NULL, last_topic=?"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (topic_name, self.account_id, channel_id, topic_name),
             )
@@ -548,7 +722,7 @@ class TopicConversationRegistry:
                 # mapping is gone. The topic it was deleted FROM is its
                 # last known name.
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO tombstones"
+                    "INSERT OR REPLACE INTO former_holders"
                     " (account_id, channel_id, topic_name, conversation_id,"
                     "  origin_name, last_topic, freed_at) VALUES (?,?,NULL,?,?,?,?)",
                     (
@@ -570,14 +744,14 @@ class TopicConversationRegistry:
         The moved topic's session set has no beneficiary — the destination
         is a different topic (same name in another channel) and sessions
         never cross channels — so the conversation is ORPHANED rather than
-        tombstoned into any topic's former set: unreachable by /continue,
+        recorded into no topic's former set: unreachable by /continue,
         retained as audit rows. Returns the conversation id, or None when
         nothing was mapped.
         """
 
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT conversation_id, origin_name FROM topic_map"
+                "SELECT conversation_id, origin_name FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             ).fetchone()
@@ -588,13 +762,13 @@ class TopicConversationRegistry:
             # topic_name (the freed topic) IS the conversation's last
             # known name here — no extra read needed.
             self._conn.execute(
-                "DELETE FROM topic_map"
+                "DELETE FROM live_holders"
                 " WHERE account_id=? AND channel_id=? AND topic_name=?",
                 (self.account_id, channel_id, topic_name),
             )
-            # Orphan the conversation's tombstone rows (no beneficiary).
+            # Orphan the conversation's former_holders rows (no beneficiary).
             self._conn.execute(
-                "UPDATE tombstones SET topic_name=NULL, last_topic=?"
+                "UPDATE former_holders SET topic_name=NULL, last_topic=?"
                 " WHERE account_id=? AND channel_id=? AND conversation_id=?",
                 (topic_name, self.account_id, channel_id, conversation_id),
             )
@@ -602,7 +776,7 @@ class TopicConversationRegistry:
             # membership): keeps it traceable after the mapping is gone.
             # The topic it was freed FROM is its last known name.
             self._conn.execute(
-                "INSERT OR REPLACE INTO tombstones"
+                "INSERT OR REPLACE INTO former_holders"
                 " (account_id, channel_id, topic_name, conversation_id,"
                 "  origin_name, last_topic, freed_at) VALUES (?,?,NULL,?,?,?,?)",
                 (self.account_id, channel_id, conversation_id, origin_name,
